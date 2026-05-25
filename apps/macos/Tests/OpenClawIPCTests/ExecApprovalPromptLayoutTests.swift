@@ -5,6 +5,36 @@ import Testing
 @Suite(.serialized)
 @MainActor
 struct ExecApprovalPromptLayoutTests {
+    @Test func `ask always prompts omit allow always by default`() {
+        let decisions = ExecApprovalsPromptPresenter.allowedPromptDecisions(
+            ExecApprovalPromptRequest(
+                command: "node script.js",
+                cwd: nil,
+                host: "node",
+                security: "allowlist",
+                ask: "always",
+                agentId: "main",
+                resolvedPath: nil,
+                sessionKey: "session-1"))
+
+        #expect(decisions == [.allowOnce, .deny])
+    }
+
+    @Test func `ask on miss prompts keep durable approval option`() {
+        let decisions = ExecApprovalsPromptPresenter.allowedPromptDecisions(
+            ExecApprovalPromptRequest(
+                command: "git status",
+                cwd: nil,
+                host: "gateway",
+                security: "allowlist",
+                ask: "on-miss",
+                agentId: "main",
+                resolvedPath: nil,
+                sessionKey: "session-1"))
+
+        #expect(decisions == [.allowOnce, .allowAlways, .deny])
+    }
+
     @Test func `accessory view reserves nonzero alert layout space`() {
         let accessory = ExecApprovalsPromptPresenter.buildAccessoryView(
             ExecApprovalPromptRequest(

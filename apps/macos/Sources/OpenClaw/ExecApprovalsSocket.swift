@@ -235,20 +235,35 @@ enum ExecApprovalsPromptPresenter {
         alert.informativeText = "Review the command details before allowing."
         alert.accessoryView = self.buildAccessoryView(request)
 
-        alert.addButton(withTitle: "Allow Once")
-        alert.addButton(withTitle: "Always Allow")
-        alert.addButton(withTitle: "Don't Allow")
-        if #available(macOS 11.0, *), alert.buttons.indices.contains(2) {
-            alert.buttons[2].hasDestructiveAction = true
+        let decisions = self.allowedPromptDecisions(request)
+        for decision in decisions {
+            alert.addButton(withTitle: self.buttonTitle(for: decision))
+        }
+        if #available(macOS 11.0, *),
+           let denyIndex = decisions.firstIndex(of: .deny),
+           alert.buttons.indices.contains(denyIndex)
+        {
+            alert.buttons[denyIndex].hasDestructiveAction = true
         }
 
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            return .allowOnce
-        case .alertSecondButtonReturn:
-            return .allowAlways
-        default:
-            return .deny
+        let selectedIndex = alert.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        return decisions.indices.contains(selectedIndex) ? decisions[selectedIndex] : .deny
+    }
+
+    static func allowedPromptDecisions(_ request: ExecApprovalPromptRequest) -> [ExecApprovalDecision] {
+        request.ask == ExecAsk.always.rawValue
+            ? [.allowOnce, .deny]
+            : [.allowOnce, .allowAlways, .deny]
+    }
+
+    private static func buttonTitle(for decision: ExecApprovalDecision) -> String {
+        switch decision {
+        case .allowOnce:
+            return "Allow Once"
+        case .allowAlways:
+            return "Always Allow"
+        case .deny:
+            return "Don't Allow"
         }
     }
 
