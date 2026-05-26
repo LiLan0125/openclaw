@@ -49,6 +49,7 @@ import {
   MIN_ANNOUNCE_RETRY_DELAY_MS,
   persistSubagentSessionTiming,
   resolveAnnounceRetryDelayMs,
+  safeRemoveAttachmentsDir,
 } from "./subagent-registry-helpers.js";
 import type { PendingFinalDeliveryPayload, SubagentRunRecord } from "./subagent-registry.types.js";
 import { deleteSubagentSessionForCleanup } from "./subagent-session-cleanup.js";

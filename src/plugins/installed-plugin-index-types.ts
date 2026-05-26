@@ -127,7 +127,7 @@ export type LoadInstalledPluginIndexParams = {
   env?: NodeJS.ProcessEnv;
   stateDir?: string;
   installRecords?: Record<string, PluginInstallRecord>;
-  candidates?: PluginCandidate[];
+  candidates?: readonly PluginCandidate[];
   diagnostics?: PluginDiagnostic[];
   discovery?: PluginDiscoveryResult;
   now?: () => Date;

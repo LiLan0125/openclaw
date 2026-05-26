@@ -1,99 +1,24 @@
-import fs from "node:fs/promises";
-import os from "node:os";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { resolveCliName } from "../cli/cli-name.js";
 import {
+  completionCacheExists,
   formatCompletionReloadCommand,
   installCompletion,
   isCompletionInstalled,
+  resolveCompletionCachePath,
   resolveCompletionProfilePath,
   resolveShellFromEnv,
+  usesSlowDynamicCompletion,
 } from "../cli/completion-runtime.js";
-import { resolveStateDir } from "../config/paths.js";
+import { resolveOpenClawPackageRoot } from "../infra/openclaw-root.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { note } from "../terminal/note.js";
-import { pathExists } from "../utils.js";
 import type { DoctorPrompter } from "./doctor-prompter.js";
 
 type CompletionShell = "zsh" | "bash" | "fish" | "powershell";
 
-export type ShellCompletionStatus = {
-  shell: CompletionShell;
-  profileInstalled: boolean;
-  /** True if profile points at the retired state-dir completion cache. */
-  usesRetiredCache: boolean;
-  retiredCachePath: string | null;
-};
-
-function sanitizeCompletionBasename(value: string): string {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return "openclaw";
-  }
-  return trimmed.replace(/[^a-zA-Z0-9._-]/g, "-");
-}
-
-function resolveRetiredCompletionCachePath(
-  shell: CompletionShell,
-  binName: string,
-  env: NodeJS.ProcessEnv = process.env,
-): string {
-  const basename = sanitizeCompletionBasename(binName);
-  const extension =
-    shell === "powershell" ? "ps1" : shell === "fish" ? "fish" : shell === "bash" ? "bash" : "zsh";
-  return path.join(resolveStateDir(env, os.homedir), "completions", `${basename}.${extension}`);
-}
-
-/** Doctor-only check for retired state-dir completion cache profile lines. */
-export async function usesRetiredCompletionCache(
-  shell: CompletionShell,
-  binName = "openclaw",
-): Promise<string | null> {
-  const home = process.env.HOME || os.homedir();
-  const profilePath =
-    shell === "zsh"
-      ? path.join(home, ".zshrc")
-      : shell === "bash"
-        ? path.join(home, ".bashrc")
-        : shell === "fish"
-          ? path.join(home, ".config", "fish", "config.fish")
-          : process.platform === "win32"
-            ? path.join(
-                process.env.USERPROFILE || home,
-                "Documents",
-                "PowerShell",
-                "Microsoft.PowerShell_profile.ps1",
-              )
-            : path.join(home, ".config", "powershell", "Microsoft.PowerShell_profile.ps1");
-
-  if (!(await pathExists(profilePath))) {
-    return null;
-  }
-
-  const cachePath = resolveRetiredCompletionCachePath(shell, binName);
-  const content = await fs.readFile(profilePath, "utf-8");
-  return content.split("\n").some((line) => line.includes(cachePath)) ? cachePath : null;
-}
-
-/** Check the status of shell completion for the current shell. */
-export async function checkShellCompletionStatus(
-  binName = "openclaw",
-): Promise<ShellCompletionStatus> {
-  const shell = resolveShellFromEnv() as CompletionShell;
-  const profileInstalled = await isCompletionInstalled(shell, binName);
-  const retiredCachePath = await usesRetiredCompletionCache(shell, binName);
-
-  return {
-    shell,
-    profileInstalled,
-    usesRetiredCache: retiredCachePath !== null,
-    retiredCachePath,
-  };
-}
-
-export type DoctorCompletionOptions = {
-  nonInteractive?: boolean;
-};
+const COMPLETION_CACHE_WRITE_TIMEOUT_MS = 30_000;
 
 function resolveCompletionReloadPath(shell: CompletionShell): string {
   if (shell === "powershell") {
@@ -110,9 +35,64 @@ function formatCompletionReloadNote(
   return `Shell completion ${action}. Restart your shell or run: ${formatCompletionReloadCommand(shell, profilePath)}`;
 }
 
+/** Generate the completion cache by spawning the CLI. */
+async function generateCompletionCache(): Promise<boolean> {
+  const root = await resolveOpenClawPackageRoot({
+    moduleUrl: import.meta.url,
+    argv1: process.argv[1],
+    cwd: process.cwd(),
+  });
+  if (!root) {
+    return false;
+  }
+
+  const binPath = path.join(root, "openclaw.mjs");
+  const result = spawnSync(process.execPath, [binPath, "completion", "--write-state"], {
+    cwd: root,
+    env: process.env,
+    encoding: "utf-8",
+    timeout: COMPLETION_CACHE_WRITE_TIMEOUT_MS,
+  });
+
+  return result.status === 0;
+}
+
+export type ShellCompletionStatus = {
+  shell: CompletionShell;
+  profileInstalled: boolean;
+  cacheExists: boolean;
+  cachePath: string;
+  /** True if profile uses slow dynamic pattern like `source <(openclaw completion ...)` */
+  usesSlowPattern: boolean;
+};
+
+/** Check the status of shell completion for the current shell. */
+export async function checkShellCompletionStatus(
+  binName = "openclaw",
+): Promise<ShellCompletionStatus> {
+  const shell = resolveShellFromEnv() as CompletionShell;
+  const profileInstalled = await isCompletionInstalled(shell, binName);
+  const cacheExists = await completionCacheExists(shell, binName);
+  const cachePath = resolveCompletionCachePath(shell, binName);
+  const usesSlowPattern = await usesSlowDynamicCompletion(shell, binName);
+
+  return {
+    shell,
+    profileInstalled,
+    cacheExists,
+    cachePath,
+    usesSlowPattern,
+  };
+}
+
+export type DoctorCompletionOptions = {
+  nonInteractive?: boolean;
+};
+
 /**
  * Doctor check for shell completion.
- * - If profile points at the retired cache file: rewrite it to dynamic sourcing
+ * - If profile uses slow dynamic pattern: upgrade to cached version
+ * - If profile has completion but no cache: auto-generate cache and upgrade profile
  * - If no completion at all: prompt to install (with user confirmation)
  */
 export async function doctorShellCompletion(
@@ -123,16 +103,46 @@ export async function doctorShellCompletion(
   const cliName = resolveCliName();
   const status = await checkShellCompletionStatus(cliName);
 
-  if (status.usesRetiredCache) {
+  // Profile uses slow dynamic pattern - upgrade to cached version
+  if (status.usesSlowPattern) {
     note(
-      `Your ${status.shell} profile points at the retired completion cache.\nRewriting it to generate completions directly from ${cliName}.`,
+      `Your ${status.shell} profile uses slow dynamic completion (source <(...)).\nUpgrading to cached completion for faster shell startup...`,
       "Shell completion",
     );
 
-    await installCompletion(status.shell, true, cliName, {
-      retiredCachePath: status.retiredCachePath,
-    });
+    // Ensure cache exists first
+    if (!status.cacheExists) {
+      const generated = await generateCompletionCache();
+      if (!generated) {
+        note(
+          `Failed to generate completion cache. Run \`${cliName} completion --write-state\` manually.`,
+          "Shell completion",
+        );
+        return;
+      }
+    }
+
+    // Upgrade profile to use cached file
+    await installCompletion(status.shell, true, cliName);
     note(formatCompletionReloadNote(status.shell, "upgraded"), "Shell completion");
+    return;
+  }
+
+  // Profile has completion but no cache - auto-fix
+  if (status.profileInstalled && !status.cacheExists) {
+    note(
+      `Shell completion is configured in your ${status.shell} profile but the cache is missing.\nRegenerating cache...`,
+      "Shell completion",
+    );
+    const generated = await generateCompletionCache();
+    if (generated) {
+      note(`Completion cache regenerated at ${status.cachePath}`, "Shell completion");
+    } else {
+      note(
+        `Failed to regenerate completion cache. Run \`${cliName} completion --write-state\` manually.`,
+        "Shell completion",
+      );
+    }
     return;
   }
 
@@ -149,8 +159,35 @@ export async function doctorShellCompletion(
     });
 
     if (shouldInstall) {
+      // First generate the cache
+      const generated = await generateCompletionCache();
+      if (!generated) {
+        note(
+          `Failed to generate completion cache. Run \`${cliName} completion --write-state\` manually.`,
+          "Shell completion",
+        );
+        return;
+      }
+
+      // Then install to profile
       await installCompletion(status.shell, true, cliName);
       note(formatCompletionReloadNote(status.shell, "installed"), "Shell completion");
     }
   }
+}
+
+/**
+ * Ensure completion cache exists. Used during setup/update to fix
+ * cases where profile has completion but no cache.
+ * This is a silent fix - no prompts.
+ */
+export async function ensureCompletionCacheExists(binName = "openclaw"): Promise<boolean> {
+  const shell = resolveShellFromEnv() as CompletionShell;
+  const cacheExists = await completionCacheExists(shell, binName);
+
+  if (cacheExists) {
+    return true;
+  }
+
+  return generateCompletionCache();
 }

@@ -1378,10 +1378,11 @@ async function findAssistantTranscriptMessageByIdempotencyKey(
     if (entry.type !== "message") {
       return false;
     }
-    const message = entry.message as Record<string, unknown> | undefined;
+    const message = entry.message as unknown as Record<string, unknown> | undefined;
     return message?.role === "assistant" && message.idempotencyKey === trimmedIdempotencyKey;
   });
-  const message = target?.type === "message" ? (target.message as Record<string, unknown>) : null;
+  const message =
+    target?.type === "message" ? (target.message as unknown as Record<string, unknown>) : null;
   if (!target?.id || !message) {
     return null;
   }
@@ -1441,7 +1442,7 @@ async function findSourceReplyTranscriptMirrorByMetadata(
     if (entry.type !== "message") {
       return false;
     }
-    const message = entry.message as Record<string, unknown> | undefined;
+    const message = entry.message as unknown as Record<string, unknown> | undefined;
     return (
       message?.role === "assistant" &&
       message.provider === "openclaw" &&
@@ -1449,7 +1450,8 @@ async function findSourceReplyTranscriptMirrorByMetadata(
       extractAssistantTranscriptText(message) === expectedText
     );
   });
-  const message = target?.type === "message" ? (target.message as Record<string, unknown>) : null;
+  const message =
+    target?.type === "message" ? (target.message as unknown as Record<string, unknown>) : null;
   if (!target?.id || !message) {
     return null;
   }

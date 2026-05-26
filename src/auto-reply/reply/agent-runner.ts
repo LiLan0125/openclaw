@@ -1280,8 +1280,7 @@ export async function runReplyAgent(params: {
     const previousRunSessionId = followupRun.run.sessionId;
     followupRun.run.sessionId = replyOperation.sessionId;
     if (replyOperation.sessionId !== previousRunSessionId) {
-      const admittedSessionEntry = refreshSessionEntryFromStore({
-        storePath,
+      const admittedSessionEntry = refreshSessionEntryFromRows({
         sessionKey: replySessionKey,
         fallbackEntry: replySessionKey
           ? (activeSessionStore?.[replySessionKey] ?? activeSessionEntry)
@@ -1290,9 +1289,6 @@ export async function runReplyAgent(params: {
       });
       if (admittedSessionEntry?.sessionId === replyOperation.sessionId) {
         activeSessionEntry = admittedSessionEntry;
-        if (admittedSessionEntry.sessionFile) {
-          followupRun.run.sessionFile = admittedSessionEntry.sessionFile;
-        }
       }
     }
   }

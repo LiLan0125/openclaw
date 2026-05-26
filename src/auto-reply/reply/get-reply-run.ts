@@ -349,7 +349,7 @@ type RunPreparedReplyParams = {
     dropPolicy?: InlineDirectives["dropPolicy"];
   };
   typing: TypingController;
-  opts?: GetReplyOptions;
+  opts?: InternalGetReplyOptions;
   defaultModel: string;
   timeoutMs: number;
   isNewSession: boolean;
@@ -1030,7 +1030,7 @@ export async function runPreparedReply(
   );
   const queuedFollowupAbortSignal =
     inboundEventKind === "room_event"
-      ? (internalOpts?.queuedFollowupAbortSignal ?? opts?.abortSignal)
+      ? (opts?.queuedFollowupAbortSignal ?? opts?.abortSignal)
       : undefined;
   const followupRun = {
     prompt: queuedBody,

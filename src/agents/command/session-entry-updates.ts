@@ -50,7 +50,7 @@ function removeLifecycleStateFromMetadataPatch(entry: SessionEntry): SessionEntr
 function persistMergedSessionEntry(params: {
   sessionKey: string;
   sessionStore?: Record<string, SessionEntry>;
-  patch: SessionEntry;
+  patch: Partial<SessionEntry>;
 }): SessionEntry {
   const agentId = resolveAgentIdFromSessionKey(params.sessionKey);
   if (!agentId) {

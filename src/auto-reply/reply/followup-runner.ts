@@ -54,6 +54,7 @@ import {
 import type { ReplyOperation } from "./reply-run-registry.js";
 import { admitReplyTurn } from "./reply-turn-admission.js";
 import { isRoutableChannel, routeReply } from "./route-reply.js";
+import { readSessionEntryRow } from "./session-row-patch.js";
 import { incrementRunCompactionCount, persistRunSessionUsage } from "./session-run-accounting.js";
 import { createTypingSignaler } from "./typing-mode.js";
 import type { TypingController } from "./typing.js";
@@ -492,18 +493,13 @@ export function createFollowupRunner(params: {
       if (replyOperation.sessionId !== run.sessionId) {
         run = { ...run, sessionId: replyOperation.sessionId };
         effectiveQueued = { ...effectiveQueued, run };
-        const admittedSessionEntry = replySessionKey
-          ? (sessionStore?.[replySessionKey] ??
-            (storePath
-              ? (readSessionEntry(storePath, replySessionKey) as SessionEntry | undefined)
-              : undefined))
-          : undefined;
+        const admittedSessionEntry = readSessionEntryRow({
+          sessionKey: replySessionKey,
+          sessionStore,
+          fallbackEntry: activeSessionEntry,
+        });
         if (admittedSessionEntry?.sessionId === replyOperation.sessionId) {
           activeSessionEntry = admittedSessionEntry;
-          if (admittedSessionEntry.sessionFile) {
-            run = { ...run, sessionFile: admittedSessionEntry.sessionFile };
-            effectiveQueued = { ...effectiveQueued, run };
-          }
         }
       }
       const runId = crypto.randomUUID();

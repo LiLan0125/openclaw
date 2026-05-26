@@ -7,6 +7,7 @@ import {
   readPersistedInstalledPluginIndexInstallRecords,
   readPersistedInstalledPluginIndexInstallRecordsSync,
 } from "./installed-plugin-index-record-reader.js";
+import { resolveInstalledPluginIndexStorePath } from "./installed-plugin-index-store-path.js";
 import {
   refreshPersistedInstalledPluginIndex,
   refreshPersistedInstalledPluginIndexSync,
@@ -27,6 +28,7 @@ export const PLUGIN_INSTALLS_CONFIG_PATH = ["plugins", "installs"] as const;
 export type InstalledPluginIndexRecordStoreOptions = {
   env?: NodeJS.ProcessEnv;
   stateDir?: string;
+  filePath?: string;
 };
 
 type InstalledPluginIndexRecordRefreshOptions = InstalledPluginIndexRecordStoreOptions &
@@ -34,26 +36,34 @@ type InstalledPluginIndexRecordRefreshOptions = InstalledPluginIndexRecordStoreO
     now?: () => Date;
   };
 
+export function resolveInstalledPluginIndexRecordsStorePath(
+  options: InstalledPluginIndexRecordStoreOptions = {},
+): string {
+  return resolveInstalledPluginIndexStorePath(options);
+}
+
 export async function writePersistedInstalledPluginIndexInstallRecords(
   records: Record<string, PluginInstallRecord>,
   options: InstalledPluginIndexRecordRefreshOptions = {},
-): Promise<void> {
+): Promise<string> {
   await refreshPersistedInstalledPluginIndex({
     ...options,
     reason: "source-changed",
     installRecords: records,
   });
+  return resolveInstalledPluginIndexRecordsStorePath(options);
 }
 
 export function writePersistedInstalledPluginIndexInstallRecordsSync(
   records: Record<string, PluginInstallRecord>,
   options: InstalledPluginIndexRecordRefreshOptions = {},
-): void {
+): string {
   refreshPersistedInstalledPluginIndexSync({
     ...options,
     reason: "source-changed",
     installRecords: records,
   });
+  return resolveInstalledPluginIndexRecordsStorePath(options);
 }
 
 export function withPluginInstallRecords(

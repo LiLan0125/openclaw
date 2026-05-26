@@ -33,12 +33,17 @@ import {
   getSubagentSessionStartedAt,
   persistSubagentSessionTiming,
   resolveArchiveAfterMs,
+  safeRemoveAttachmentsDir,
 } from "./subagent-registry-helpers.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 import type { SubagentSessionCompletion } from "./subagent-session-reconciliation.js";
 
 const log = createSubsystemLogger("agents/subagent-registry");
 const RECOVERABLE_WAIT_RETRY_DELAY_MS = process.env.OPENCLAW_TEST_FAST === "1" ? 25 : 5_000;
+
+function shouldDeleteAttachments(entry: SubagentRunRecord) {
+  return entry.cleanup === "delete" || !entry.retainAttachmentsOnKeep;
+}
 
 export function markSubagentRunPausedAfterYield(params: {
   entry: SubagentRunRecord;
@@ -102,6 +107,9 @@ export type RegisterSubagentRunParams = {
   runTimeoutSeconds?: number;
   expectsCompletionMessage?: boolean;
   spawnMode?: "run" | "session";
+  attachmentsDir?: string;
+  attachmentsRootDir?: string;
+  retainAttachmentsOnKeep?: boolean;
 };
 
 export function createSubagentRunManager(params: {

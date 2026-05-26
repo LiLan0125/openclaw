@@ -195,17 +195,21 @@ export async function readSubagentOutput(
 ): Promise<string | undefined> {
   let messages: unknown[] | undefined;
   if (options?.sessionFile) {
-    const transcriptMessages = await subagentAnnounceOutputDeps.readSessionMessagesAsync(
-      sessionKey,
-      undefined,
-      options.sessionFile,
-      {
-        mode: "recent",
-        maxMessages: 100,
-        maxBytes: 1024 * 1024,
-      },
-    );
-    messages = transcriptMessages;
+    const agentId = resolveAgentIdFromSessionKey(sessionKey);
+    const entry = getSessionEntry({ agentId, sessionKey });
+    messages = entry?.sessionId
+      ? await subagentAnnounceOutputDeps.readSessionMessagesAsync(
+          {
+            agentId,
+            sessionId: entry.sessionId,
+          },
+          {
+            mode: "recent",
+            maxMessages: 100,
+            maxBytes: 1024 * 1024,
+          },
+        )
+      : [];
   }
   const history =
     messages === undefined
