@@ -4432,6 +4432,14 @@ td.data-table-key-col {
   gap: 8px;
 }
 
+.exec-approval-reopen {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 35;
+  box-shadow: var(--shadow-lg);
+}
+
 /* ===========================================
    Agents
    =========================================== */

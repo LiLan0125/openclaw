@@ -29,9 +29,11 @@ test("renders command spans in Chromium approval modal", async () => {
           expiresAtMs: Date.now() + 60_000,
         },
       ],
+      execApprovalDismissedIds: new Set(),
       execApprovalBusy: false,
       execApprovalError: null,
       handleExecApprovalDecision: async () => undefined,
+      handleExecApprovalDismiss: () => undefined,
     } as unknown as AppViewState),
     root,
   );

@@ -3,10 +3,7 @@
 import { nothing, render } from "lit";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { i18n } from "../../i18n/index.ts";
-import {
-  getRenderedModalDialog,
-  installDialogPolyfill,
-} from "../../test-helpers/modal-dialog.ts";
+import { getRenderedModalDialog, installDialogPolyfill } from "../../test-helpers/modal-dialog.ts";
 import { createStorageMock } from "../../test-helpers/storage.ts";
 import type { AppViewState } from "../app-view-state.ts";
 import type { ExecApprovalRequest } from "../controllers/exec-approval.ts";
@@ -52,15 +49,24 @@ function createExecState(
   overrides: Partial<
     Pick<
       AppViewState,
-      "execApprovalBusy" | "execApprovalError" | "execApprovalQueue" | "handleExecApprovalDecision"
+      | "execApprovalBusy"
+      | "execApprovalDismissedIds"
+      | "execApprovalError"
+      | "execApprovalQueue"
+      | "handleExecApprovalDecision"
+      | "handleExecApprovalDismiss"
+      | "handleExecApprovalShow"
     >
   > = {},
 ): AppViewState {
   return {
     execApprovalQueue: [createExecRequest()],
+    execApprovalDismissedIds: new Set(),
     execApprovalBusy: false,
     execApprovalError: null,
     handleExecApprovalDecision: vi.fn(async () => undefined),
+    handleExecApprovalDismiss: vi.fn(),
+    handleExecApprovalShow: vi.fn(),
     ...overrides,
   } as unknown as AppViewState;
 }
@@ -130,22 +136,33 @@ describe("approval and confirmation modals", () => {
     expect(spans).toEqual(["ls", "python -c"]);
   });
 
-  it("maps Escape to exec denial when approval is idle", async () => {
+  it("maps Escape to dismiss when approval is idle", async () => {
     const handleExecApprovalDecision = vi.fn(async () => undefined);
-    render(renderExecApprovalPrompt(createExecState({ handleExecApprovalDecision })), container);
+    const handleExecApprovalDismiss = vi.fn();
+    render(
+      renderExecApprovalPrompt(
+        createExecState({ handleExecApprovalDecision, handleExecApprovalDismiss }),
+      ),
+      container,
+    );
 
     const { dialog } = await getRenderedDialog();
     dispatchEscape(dialog);
 
-    expect(handleExecApprovalDecision).toHaveBeenCalledTimes(1);
-    expect(handleExecApprovalDecision).toHaveBeenCalledWith("deny");
+    expect(handleExecApprovalDismiss).toHaveBeenCalledTimes(1);
+    expect(handleExecApprovalDecision).not.toHaveBeenCalled();
   });
 
-  it("does not dispatch an extra exec decision from Escape while busy", async () => {
+  it("allows Escape dismissal while busy", async () => {
     const handleExecApprovalDecision = vi.fn(async () => undefined);
+    const handleExecApprovalDismiss = vi.fn();
     render(
       renderExecApprovalPrompt(
-        createExecState({ execApprovalBusy: true, handleExecApprovalDecision }),
+        createExecState({
+          execApprovalBusy: true,
+          handleExecApprovalDecision,
+          handleExecApprovalDismiss,
+        }),
       ),
       container,
     );
@@ -154,6 +171,26 @@ describe("approval and confirmation modals", () => {
     dispatchEscape(dialog);
 
     expect(handleExecApprovalDecision).not.toHaveBeenCalled();
+    expect(handleExecApprovalDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders a reopen control when all pending approvals are dismissed", () => {
+    const handleExecApprovalShow = vi.fn();
+    render(
+      renderExecApprovalPrompt(
+        createExecState({
+          execApprovalDismissedIds: new Set(["approval-1"]),
+          handleExecApprovalShow,
+        }),
+      ),
+      container,
+    );
+
+    expect(container.querySelector("openclaw-modal-dialog")).toBeNull();
+    const reopen = container.querySelector<HTMLButtonElement>(".exec-approval-reopen");
+    expect(reopen?.textContent?.trim()).toBe("1 pending");
+    reopen?.click();
+    expect(handleExecApprovalShow).toHaveBeenCalledWith("approval-1");
   });
 
   it("renders exec approval chrome from the active locale", async () => {
@@ -218,7 +255,7 @@ describe("approval and confirmation modals", () => {
       Array.from(container.querySelectorAll(".exec-approval-actions button")).map((button) =>
         button.textContent?.trim(),
       ),
-    ).toEqual(["允许一次", "始终允许", "拒绝"]);
+    ).toEqual(["关闭", "允许一次", "始终允许", "拒绝"]);
   });
 
   it("uses the shared modal primitive for gateway URL confirmation and cancels on Escape", async () => {

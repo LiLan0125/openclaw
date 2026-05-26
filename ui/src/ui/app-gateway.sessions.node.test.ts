@@ -44,10 +44,13 @@ vi.mock("./controllers/devices.ts", () => ({
 }));
 vi.mock("./controllers/exec-approval.ts", () => ({
   addExecApproval: vi.fn(),
+  clearResolvedExecApprovalPrompt: vi.fn(),
   parseExecApprovalRequested: vi.fn(() => null),
   parseExecApprovalResolved: vi.fn(() => null),
+  parsePluginApprovalRequested: vi.fn(() => null),
   pruneExecApprovalQueue: vi.fn((queue) => queue),
   removeExecApproval: vi.fn(),
+  showExecApprovalPrompt: vi.fn(),
 }));
 vi.mock("./controllers/nodes.ts", () => ({
   loadNodes: vi.fn(),
@@ -133,6 +136,7 @@ function createHost() {
     toolStreamOrder: [],
     refreshSessionsAfterChat: new Set<string>(),
     execApprovalQueue: [],
+    execApprovalDismissedIds: new Set(),
     execApprovalError: null,
     updateAvailable: null,
   } as unknown as Parameters<typeof handleGatewayEvent>[0];

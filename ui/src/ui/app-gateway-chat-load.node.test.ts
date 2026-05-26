@@ -90,11 +90,13 @@ vi.mock("./controllers/devices.ts", () => ({
 
 vi.mock("./controllers/exec-approval.ts", () => ({
   addExecApproval: vi.fn((queue, entry) => [...queue, entry]),
+  clearResolvedExecApprovalPrompt: vi.fn(),
   parseExecApprovalRequested: vi.fn(() => null),
   parseExecApprovalResolved: vi.fn(() => null),
   parsePluginApprovalRequested: vi.fn(() => null),
   pruneExecApprovalQueue: vi.fn((queue) => queue),
   removeExecApproval: vi.fn((queue) => queue),
+  showExecApprovalPrompt: vi.fn(),
 }));
 
 vi.mock("./controllers/health.ts", () => ({
@@ -172,6 +174,7 @@ function createHost(tab: Tab) {
     pendingAbort: null,
     refreshSessionsAfterChat: new Set<string>(),
     execApprovalQueue: [],
+    execApprovalDismissedIds: new Set(),
     execApprovalError: null,
     updateAvailable: null,
     reconcileWebPushState: verifyPushMock,

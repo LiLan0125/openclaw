@@ -182,6 +182,7 @@ export type AppViewState = {
   execApprovalsTarget: "gateway" | "node";
   execApprovalsTargetNodeId: string | null;
   execApprovalQueue: ExecApprovalRequest[];
+  execApprovalDismissedIds: Set<string>;
   execApprovalBusy: boolean;
   execApprovalError: string | null;
   pendingGatewayUrl: string | null;
@@ -480,6 +481,8 @@ export type AppViewState = {
     handleNostrProfileImport: () => Promise<void>;
     handleNostrProfileToggleAdvanced: () => void;
     handleExecApprovalDecision: (decision: "allow-once" | "allow-always" | "deny") => Promise<void>;
+    handleExecApprovalDismiss: () => void;
+    handleExecApprovalShow: (id: string) => void;
     handleGatewayUrlConfirm: () => void;
     handleGatewayUrlCancel: () => void;
     handleConfigLoad: () => Promise<void>;
