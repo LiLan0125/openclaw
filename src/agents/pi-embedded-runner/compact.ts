@@ -1036,6 +1036,7 @@ async function compactEmbeddedPiSessionDirectOnce(
       const extensionFactories = buildEmbeddedExtensionFactories({
         cfg: params.config,
         sessionManager,
+        workspaceDir: effectiveWorkspace,
         provider,
         modelId,
         model,
@@ -1147,6 +1148,7 @@ async function compactEmbeddedPiSessionDirectOnce(
             sessionManager,
             sessionId: params.sessionId,
             policy: transcriptPolicy,
+            preserveLatestAssistantThinking: false,
           });
           const validated = await validateReplayTurns({
             messages: prior,

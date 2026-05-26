@@ -31,6 +31,18 @@ function loadTarRuntime(): Promise<TarRuntime> {
   return tarRuntimePromise;
 }
 
+type BackupLinkCacheKey = `${number}:${number}`;
+
+class BackupLinkCache extends Map<BackupLinkCacheKey, string> {
+  override get(_key: BackupLinkCacheKey): undefined {
+    return undefined;
+  }
+
+  override set(_key: BackupLinkCacheKey, _value: string): this {
+    return this;
+  }
+}
+
 export type BackupCreateOptions = {
   output?: string;
   dryRun?: boolean;
@@ -724,6 +736,7 @@ export async function createBackupArchive(
             gzip: true,
             portable: true,
             preservePaths: true,
+            linkCache: new BackupLinkCache(),
             onWriteEntry: (entry) => {
               entry.path = remapArchiveEntryPath({
                 entryPath: entry.path,

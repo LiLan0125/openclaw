@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
-  appendSqliteSessionTranscriptEvent,
+  appendSqliteSessionTranscriptEvents,
   loadSqliteSessionTranscriptEvents,
   replaceSqliteSessionTranscriptEvents,
   resolveSqliteSessionTranscriptScope,
@@ -418,6 +418,7 @@ export async function persistTranscriptStateMutationForSession(params: {
   sessionId: string;
   state: TranscriptState;
   appendedEntries: SessionEntry[];
+  supersededMessageIdempotencyEventIds?: string[];
 }): Promise<void> {
   if (params.appendedEntries.length === 0) {
     return;
@@ -432,9 +433,11 @@ export async function persistTranscriptStateMutationForSession(params: {
       `Cannot append SQLite transcript without a session header for agent ${params.agentId} session ${params.sessionId}`,
     );
   }
-  for (const entry of params.appendedEntries) {
-    appendSqliteSessionTranscriptEvent({ ...scope, event: entry });
-  }
+  appendSqliteSessionTranscriptEvents({
+    ...scope,
+    events: params.appendedEntries,
+    supersededMessageIdempotencyEventIds: params.supersededMessageIdempotencyEventIds,
+  });
 }
 
 export function persistTranscriptStateMutationForSessionSync(params: {
@@ -443,6 +446,7 @@ export function persistTranscriptStateMutationForSessionSync(params: {
   sessionId: string;
   state: TranscriptState;
   appendedEntries: SessionEntry[];
+  supersededMessageIdempotencyEventIds?: string[];
 }): void {
   if (params.appendedEntries.length === 0) {
     return;
@@ -457,9 +461,11 @@ export function persistTranscriptStateMutationForSessionSync(params: {
       `Cannot append SQLite transcript without a session header for agent ${params.agentId} session ${params.sessionId}`,
     );
   }
-  for (const entry of params.appendedEntries) {
-    appendSqliteSessionTranscriptEvent({ ...scope, event: entry });
-  }
+  appendSqliteSessionTranscriptEvents({
+    ...scope,
+    events: params.appendedEntries,
+    supersededMessageIdempotencyEventIds: params.supersededMessageIdempotencyEventIds,
+  });
 }
 
 export function removeTailEntriesFromSqliteTranscript(params: {

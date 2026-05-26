@@ -34,6 +34,7 @@ import {
 import { agentCommandFromIngress } from "../../commands/agent.js";
 import {
   evaluateSessionFreshness,
+  getSessionEntry,
   mergeSessionEntry,
   resolveChannelResetConfig,
   resolveAgentIdFromSessionKey,
@@ -72,6 +73,7 @@ import { defaultRuntime } from "../../runtime.js";
 import {
   annotateInterSessionPromptText,
   normalizeInputProvenance,
+  shouldPreserveUserFacingSessionStateForInputProvenance,
   type InputProvenance,
 } from "../../sessions/input-provenance.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
@@ -727,6 +729,8 @@ export const agentHandlers: GatewayRequestHandlers = {
       acpTurnSource?: "manual_spawn";
       internalRuntimeHandoffId?: string;
       internalEvents?: AgentInternalEvent[];
+      suppressPromptPersistence?: boolean;
+      sessionEffects?: "visible" | "internal";
       idempotencyKey: string;
       sourceReplyDeliveryMode?: "automatic" | "message_tool_only";
       disableMessageTool?: boolean;
@@ -748,6 +752,8 @@ export const agentHandlers: GatewayRequestHandlers = {
     const canResetSession = resolveCanResetSessionFromClient(client);
     const canUseInternalRuntimeHandoff = resolveCanUseInternalRuntimeHandoff(client);
     const requestedModelOverride = Boolean(request.provider || request.model);
+    const requestedInternalSessionEffects = request.sessionEffects === "internal";
+    const requestedPromptPersistenceSuppression = request.suppressPromptPersistence === true;
     const isRawModelRun = request.modelRun === true || request.promptMode === "none";
     if (requestedModelOverride && !allowModelOverride) {
       respond(
@@ -756,6 +762,20 @@ export const agentHandlers: GatewayRequestHandlers = {
         errorShape(
           ErrorCodes.INVALID_REQUEST,
           "provider/model overrides are not authorized for this caller.",
+        ),
+      );
+      return;
+    }
+    if (
+      (requestedInternalSessionEffects || requestedPromptPersistenceSuppression) &&
+      !canUseInternalRuntimeHandoff
+    ) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "internal session-effect controls are reserved for backend callers.",
         ),
       );
       return;
@@ -787,6 +807,11 @@ export const agentHandlers: GatewayRequestHandlers = {
     let resolvedGroupSpace: string | undefined = normalizedSpawned.groupSpace;
     let spawnedByValue: string | undefined;
     const inputProvenance = normalizeInputProvenance(request.inputProvenance);
+    const preserveUserFacingSessionModelState =
+      canUseInternalRuntimeHandoff &&
+      shouldPreserveUserFacingSessionStateForInputProvenance(inputProvenance);
+    const sessionEffects = requestedInternalSessionEffects ? "internal" : request.sessionEffects;
+    const suppressVisibleSessionEffects = sessionEffects === "internal";
     const agentDedupeKeys = resolveAgentDedupeKeys({
       idempotencyKey: idem,
       execApprovalFollowupApprovalId,
@@ -1214,69 +1239,14 @@ export const agentHandlers: GatewayRequestHandlers = {
             ? normalizeOptionalString(client?.internal?.pluginRuntimeOwnerId)
             : normalizeOptionalString(entry.pluginOwnerId);
         const sessionAgent = resolveAgentIdFromSessionKey(canonicalKey);
-        spawnedByValue = canonicalizeSpawnedByForAgent(cfg, sessionAgent, entry?.spawnedBy);
-        const storedGroup = normalizeTrustedGroupMetadata(entry);
-        let inheritedGroup: TrustedGroupMetadata | undefined;
-        if (
-          spawnedByValue &&
-          (!storedGroup.groupId || !storedGroup.groupChannel || !storedGroup.groupSpace)
-        ) {
-          try {
-            const parentEntry = loadSessionEntry(spawnedByValue)?.entry;
-            const parentGroupKey = parseGroupKey(spawnedByValue);
-            inheritedGroup = normalizeTrustedGroupMetadata({
-              groupId: parentEntry?.groupId,
-              groupChannel: parentEntry?.groupChannel,
-              groupSpace: parentEntry?.space,
-            });
-            inheritedGroup = normalizeTrustedGroupMetadata({
-              groupId: inheritedGroup.groupId ?? parentGroupKey?.id,
-              groupChannel: inheritedGroup.groupChannel,
-              groupSpace: inheritedGroup.groupSpace,
-            });
-          } catch {
-            inheritedGroup = undefined;
-          }
-        }
-        const trustedGroup = resolveTrustedGroupMetadata({
-          stored: storedGroup,
-          inherited: inheritedGroup,
-          typedGroupId:
-            routingInfo?.chatType === "group" || routingInfo?.chatType === "channel"
-              ? routingInfo.conversationPeerId
-              : parseGroupKey(canonicalKey)?.id,
-        });
-        const trustRequestSelectors =
-          Boolean(trustedGroup.groupId) &&
-          requestGroupMatchesTrusted({
-            requestGroupId: normalizedSpawned.groupId,
-            trustedGroupId: trustedGroup.groupId,
-          });
-        if (!trustedGroup.groupId || !trustRequestSelectors) {
-          resolvedGroupId = undefined;
-          resolvedGroupChannel = undefined;
-          resolvedGroupSpace = undefined;
-        } else {
-          resolvedGroupId =
-            storedGroup.groupId ??
-            inheritedGroup?.groupId ??
-            normalizedSpawned.groupId ??
-            trustedGroup.groupId;
-          resolvedGroupChannel =
-            trustedGroup.groupChannel ??
-            (trustRequestSelectors ? normalizedSpawned.groupChannel : undefined);
-          resolvedGroupSpace =
-            trustedGroup.groupSpace ??
-            (trustRequestSelectors ? normalizedSpawned.groupSpace : undefined);
-        }
-        const deliveryFields = normalizeSessionDeliveryFields({
-          deliveryContext: entry?.deliveryContext,
-        });
-        // When the session has no delivery context yet (e.g. a freshly-spawned subagent
-        // with deliver: false), seed it from the request's channel/to/threadId params.
-        // Without this, subagent sessions end up with a channel-only deliveryContext
-        // and no `to`/`threadId`, which causes announce delivery to either target the
-        // wrong inherited route or fail entirely.
+        const rotatedSessionId = Boolean(entry?.sessionId && entry.sessionId !== sessionId);
+        type AgentSessionPatchBuild = {
+          patch: Partial<SessionEntry>;
+          spawnedBy: string | undefined;
+          groupId: string | undefined;
+          groupChannel: string | undefined;
+          groupSpace: string | undefined;
+        };
         const requestHasDeliveryTarget =
           Boolean(request.to?.trim()) || request.threadId !== undefined;
         const requestDeliveryHint = requestHasDeliveryTarget
@@ -1289,79 +1259,206 @@ export const agentHandlers: GatewayRequestHandlers = {
               threadId: request.threadId,
             })
           : undefined;
-        const effectiveDelivery = mergeDeliveryContext(
-          deliveryFields.deliveryContext,
-          requestDeliveryHint,
-        );
-        const effectiveDeliveryFields = normalizeSessionDeliveryFields({
-          deliveryContext: effectiveDelivery,
-        });
-        const nextEntryPatch: SessionEntry = {
-          sessionId,
-          updatedAt: now,
-          sessionStartedAt: isNewSession
-            ? now
-            : (entry?.sessionStartedAt ??
-              resolveSessionLifecycleTimestamps({
-                entry,
-                agentId: resolveAgentIdFromSessionKey(canonicalKey),
-                databasePath,
-              }).sessionStartedAt),
-          lastInteractionAt: touchInteraction ? now : entry?.lastInteractionAt,
-          thinkingLevel: entry?.thinkingLevel,
-          fastMode: entry?.fastMode,
-          verboseLevel: entry?.verboseLevel,
-          traceLevel: entry?.traceLevel,
-          reasoningLevel: entry?.reasoningLevel,
-          systemSent: entry?.systemSent,
-          sendPolicy: entry?.sendPolicy,
-          skillsSnapshot: entry?.skillsSnapshot,
-          deliveryContext: effectiveDeliveryFields.deliveryContext,
-          modelOverride: entry?.modelOverride,
-          providerOverride: entry?.providerOverride,
-          label: labelValue,
-          spawnedBy: spawnedByValue,
-          spawnedWorkspaceDir: entry?.spawnedWorkspaceDir,
-          spawnDepth: entry?.spawnDepth,
-          channel: effectiveDeliveryFields.deliveryContext?.channel ?? entry?.channel,
-          groupId: resolvedGroupId,
-          groupChannel: resolvedGroupChannel,
-          space: resolvedGroupSpace,
-          ...(pluginOwnerId ? { pluginOwnerId } : {}),
-          cliSessionBindings: entry?.cliSessionBindings,
-        };
-        const mergeBase = isNewSession ? resetSessionRunStateForFreshSession(entry) : entry;
-        sessionEntry = mergeSessionEntry(mergeBase, nextEntryPatch);
-        if (request.deliver === true) {
-          const sendPolicy = resolveSendPolicy({
+        const buildSessionPatch = (
+          freshEntry: SessionEntry | undefined,
+        ): AgentSessionPatchBuild => {
+          const freshSpawnedBy = canonicalizeSpawnedByForAgent(
             cfg,
-            entry: sessionEntry,
-            sessionKey: canonicalKey,
-            channel: sessionEntry?.channel,
-            chatType: sessionEntry?.chatType,
-          });
-          if (sendPolicy === "deny") {
-            respond(
-              false,
-              undefined,
-              errorShape(ErrorCodes.INVALID_REQUEST, "send blocked by session policy"),
-            );
-            return;
+            sessionAgent,
+            freshEntry?.spawnedBy,
+          );
+          const storedGroup = normalizeTrustedGroupMetadata(freshEntry);
+          let inheritedGroup: TrustedGroupMetadata | undefined;
+          if (
+            freshSpawnedBy &&
+            (!storedGroup.groupId || !storedGroup.groupChannel || !storedGroup.groupSpace)
+          ) {
+            try {
+              const parentEntry = loadSessionEntry(freshSpawnedBy)?.entry;
+              const parentGroupKey = parseGroupKey(freshSpawnedBy);
+              const parentGroup = normalizeTrustedGroupMetadata({
+                groupId: parentEntry?.groupId,
+                groupChannel: parentEntry?.groupChannel,
+                groupSpace: parentEntry?.space,
+              });
+              inheritedGroup = normalizeTrustedGroupMetadata({
+                groupId: parentGroup.groupId ?? parentGroupKey?.id,
+                groupChannel: parentGroup.groupChannel,
+                groupSpace: parentGroup.groupSpace,
+              });
+            } catch {
+              inheritedGroup = undefined;
+            }
           }
-        }
-        resolvedSessionId = sessionId;
+          const trustedGroup = resolveTrustedGroupMetadata({
+            stored: storedGroup,
+            inherited: inheritedGroup,
+            typedGroupId:
+              routingInfo?.chatType === "group" || routingInfo?.chatType === "channel"
+                ? routingInfo.conversationPeerId
+                : parseGroupKey(canonicalKey)?.id,
+          });
+          const trustRequestSelectors =
+            Boolean(trustedGroup.groupId) &&
+            requestGroupMatchesTrusted({
+              requestGroupId: normalizedSpawned.groupId,
+              trustedGroupId: trustedGroup.groupId,
+            });
+          const nextGroup =
+            !trustedGroup.groupId || !trustRequestSelectors
+              ? {
+                  groupId: undefined,
+                  groupChannel: undefined,
+                  groupSpace: undefined,
+                }
+              : {
+                  groupId:
+                    storedGroup.groupId ??
+                    inheritedGroup?.groupId ??
+                    normalizedSpawned.groupId ??
+                    trustedGroup.groupId,
+                  groupChannel:
+                    trustedGroup.groupChannel ??
+                    (trustRequestSelectors ? normalizedSpawned.groupChannel : undefined),
+                  groupSpace:
+                    trustedGroup.groupSpace ??
+                    (trustRequestSelectors ? normalizedSpawned.groupSpace : undefined),
+                };
+
+          const deliveryFields = normalizeSessionDeliveryFields(freshEntry);
+          // When the session has no delivery context yet (e.g. a freshly-spawned
+          // subagent with deliver: false), seed it from request channel/to/threadId.
+          const effectiveDelivery = mergeDeliveryContext(
+            deliveryFields.deliveryContext,
+            requestDeliveryHint,
+          );
+          const effectiveDeliveryFields = normalizeSessionDeliveryFields({
+            route: deliveryFields.route,
+            deliveryContext: effectiveDelivery,
+          });
+          const freshLabelValue = normalizeOptionalString(request.label) || freshEntry?.label;
+          const channelValue =
+            effectiveDeliveryFields.deliveryContext?.channel ??
+            freshEntry?.channel ??
+            request.channel?.trim();
+          const freshPluginOwnerId =
+            freshEntry === undefined
+              ? normalizeOptionalString(client?.internal?.pluginRuntimeOwnerId)
+              : normalizeOptionalString(freshEntry.pluginOwnerId);
+          const freshSessionRotatedSinceLoad = Boolean(
+            entry?.sessionId && freshEntry?.sessionId && freshEntry.sessionId !== entry.sessionId,
+          );
+          const patchSessionId = freshSessionRotatedSinceLoad ? freshEntry?.sessionId : sessionId;
+          const shouldClearRotatedState = rotatedSessionId && !freshSessionRotatedSinceLoad;
+          const patch: Partial<SessionEntry> = {
+            sessionId: patchSessionId,
+            updatedAt: now,
+            ...(isNewSession && !freshSessionRotatedSinceLoad ? { sessionStartedAt: now } : {}),
+            ...(touchInteraction ? { lastInteractionAt: now } : {}),
+            ...(effectiveDeliveryFields.route ? { route: effectiveDeliveryFields.route } : {}),
+            ...(effectiveDeliveryFields.deliveryContext
+              ? { deliveryContext: effectiveDeliveryFields.deliveryContext }
+              : {}),
+            ...(effectiveDeliveryFields.lastChannel
+              ? { lastChannel: effectiveDeliveryFields.lastChannel }
+              : {}),
+            ...(effectiveDeliveryFields.lastTo ? { lastTo: effectiveDeliveryFields.lastTo } : {}),
+            ...(effectiveDeliveryFields.lastAccountId
+              ? { lastAccountId: effectiveDeliveryFields.lastAccountId }
+              : {}),
+            ...(effectiveDeliveryFields.lastThreadId != null
+              ? { lastThreadId: effectiveDeliveryFields.lastThreadId }
+              : {}),
+            ...(freshLabelValue ? { label: freshLabelValue } : {}),
+            ...(freshSpawnedBy ? { spawnedBy: freshSpawnedBy } : {}),
+            ...(channelValue ? { channel: channelValue } : {}),
+            groupId: nextGroup.groupId,
+            groupChannel: nextGroup.groupChannel,
+            space: nextGroup.groupSpace,
+            ...(freshPluginOwnerId ? { pluginOwnerId: freshPluginOwnerId } : {}),
+            ...(shouldClearRotatedState
+              ? {
+                  status: undefined,
+                  startedAt: undefined,
+                  endedAt: undefined,
+                  runtimeMs: undefined,
+                  abortedLastRun: undefined,
+                  sessionFile: undefined,
+                }
+              : {}),
+          };
+          return {
+            patch,
+            spawnedBy: freshSpawnedBy,
+            groupId: nextGroup.groupId,
+            groupChannel: nextGroup.groupChannel,
+            groupSpace: nextGroup.groupSpace,
+          };
+        };
+        let patchBuild = buildSessionPatch(entry);
+        sessionEntry = mergeSessionEntry(entry, patchBuild.patch);
+        resolvedSessionId = sessionEntry?.sessionId ?? sessionId;
         const canonicalSessionKey = canonicalKey;
         resolvedSessionKey = canonicalSessionKey;
         const agentId = resolveAgentIdFromSessionKey(canonicalSessionKey);
         const mainSessionKey = resolveAgentMainSessionKey({ cfg, agentId });
-        const persisted = mergeSessionEntry(mergeBase, nextEntryPatch);
-        upsertSessionEntry({
-          agentId: sessionAgentId,
-          sessionKey: canonicalSessionKey,
-          entry: persisted,
-        });
-        sessionEntry = persisted;
-        if (canonicalSessionKey === mainSessionKey || canonicalSessionKey === "global") {
+        const recoveredSessionStartedAt: number | undefined =
+          !isNewSession && entry !== undefined && entry.sessionStartedAt === undefined
+            ? resolveSessionLifecycleTimestamps({
+                entry,
+                agentId,
+                databasePath,
+              }).sessionStartedAt
+            : undefined;
+        if (!suppressVisibleSessionEffects) {
+          let freshEntry =
+            getSessionEntry({
+              agentId: sessionAgentId,
+              path: databasePath,
+              sessionKey: canonicalSessionKey,
+            }) ?? entry;
+          patchBuild = buildSessionPatch(freshEntry);
+          const effectivePatch =
+            recoveredSessionStartedAt !== undefined &&
+            freshEntry?.sessionStartedAt === undefined &&
+            freshEntry?.sessionId === entry?.sessionId
+              ? { ...patchBuild.patch, sessionStartedAt: recoveredSessionStartedAt }
+              : patchBuild.patch;
+          const merged = mergeSessionEntry(freshEntry, effectivePatch);
+          if (request.deliver === true) {
+            const sendPolicy = resolveSendPolicy({
+              cfg,
+              entry: merged,
+              sessionKey: canonicalKey,
+              channel: merged?.channel,
+              chatType: merged?.chatType,
+            });
+            if (sendPolicy === "deny") {
+              respond(
+                false,
+                undefined,
+                errorShape(ErrorCodes.INVALID_REQUEST, "send blocked by session policy"),
+              );
+              return;
+            }
+          }
+          upsertSessionEntry({
+            agentId: sessionAgentId,
+            path: databasePath,
+            sessionKey: canonicalSessionKey,
+            entry: merged,
+          });
+          sessionEntry = merged;
+          resolvedSessionId = merged.sessionId;
+        }
+        spawnedByValue = patchBuild.spawnedBy;
+        resolvedGroupId = patchBuild.groupId;
+        resolvedGroupChannel = patchBuild.groupChannel;
+        resolvedGroupSpace = patchBuild.groupSpace;
+        if (
+          !suppressVisibleSessionEffects &&
+          (canonicalSessionKey === mainSessionKey || canonicalSessionKey === "global")
+        ) {
           context.addChatRun(idem, {
             sessionKey: canonicalSessionKey,
             clientRunId: idem,
@@ -1370,7 +1467,12 @@ export const agentHandlers: GatewayRequestHandlers = {
             bestEffortDeliver = true;
           }
         }
-        registerAgentRunContext(idem, { sessionKey: canonicalSessionKey });
+        registerAgentRunContext(
+          idem,
+          suppressVisibleSessionEffects
+            ? { isControlUiVisible: false }
+            : { sessionKey: canonicalSessionKey },
+        );
       }
 
       const connId = typeof client?.connId === "string" ? client.connId : undefined;
@@ -1717,11 +1819,16 @@ export const agentHandlers: GatewayRequestHandlers = {
               acpTurnSource: request.acpTurnSource,
               internalEvents: request.internalEvents,
               inputProvenance,
+              sessionEffects,
+              preserveUserFacingSessionModelState,
               sourceReplyDeliveryMode: request.sourceReplyDeliveryMode,
-              suppressPromptPersistence: shouldSuppressPromptPersistenceForAgentRun({
-                inputProvenance,
-                internalEvents: request.internalEvents,
-              }),
+              disableMessageTool: request.disableMessageTool,
+              suppressPromptPersistence:
+                requestedPromptPersistenceSuppression ||
+                shouldSuppressPromptPersistenceForAgentRun({
+                  inputProvenance,
+                  internalEvents: request.internalEvents,
+                }),
               initialVfsEntries: request.initialVfsEntries,
               cleanupBundleMcpOnRunEnd: request.cleanupBundleMcpOnRunEnd,
               abortSignal: activeRunAbort.controller.signal,

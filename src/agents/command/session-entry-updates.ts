@@ -92,6 +92,7 @@ export async function updateSessionEntryAfterAgentRun(params: {
    * heartbeat model does not "bleed" into the main session's perceived state.
    */
   preserveRuntimeModel?: boolean;
+  preserveUserFacingSessionModelState?: boolean;
 }) {
   const {
     cfg,
@@ -113,7 +114,7 @@ export async function updateSessionEntryAfterAgentRun(params: {
   const compactionTokensAfter =
     typeof result.meta.agentMeta?.compactionTokensAfter === "number" &&
     Number.isFinite(result.meta.agentMeta.compactionTokensAfter) &&
-    result.meta.agentMeta.compactionTokensAfter > 0
+    result.meta.agentMeta.compactionTokensAfter >= 0
       ? Math.floor(result.meta.agentMeta.compactionTokensAfter)
       : undefined;
   const compactionsThisRun = Math.max(0, result.meta.agentMeta?.compactionCount ?? 0);
@@ -135,7 +136,8 @@ export async function updateSessionEntryAfterAgentRun(params: {
             allowAsyncLoad: false,
           }) ?? DEFAULT_CONTEXT_TOKENS);
 
-  const preserveRuntimeModel = params.preserveRuntimeModel === true;
+  const preserveUserFacingRunState = params.preserveUserFacingSessionModelState === true;
+  const preserveRuntimeModel = params.preserveRuntimeModel === true || preserveUserFacingRunState;
   const entry = sessionStore[sessionKey] ?? {
     sessionId,
     updatedAt: now,
@@ -181,30 +183,32 @@ export async function updateSessionEntryAfterAgentRun(params: {
       model: modelUsed,
     });
   }
-  if (agentHarnessId) {
-    next.agentHarnessId = agentHarnessId;
-  } else if (result.meta.executionTrace?.runner === "cli") {
-    next.agentHarnessId = undefined;
-  }
-  if (isCliProvider(providerUsed, cfg)) {
-    const cliSessionBinding = result.meta.agentMeta?.cliSessionBinding;
-    if (cliSessionBinding?.sessionId?.trim()) {
-      setCliSessionBinding(next, providerUsed, cliSessionBinding);
-    } else {
-      const cliSessionId = result.meta.agentMeta?.sessionId?.trim();
-      if (cliSessionId) {
-        setCliSessionId(next, providerUsed, cliSessionId);
+  if (!preserveUserFacingRunState) {
+    if (agentHarnessId) {
+      next.agentHarnessId = agentHarnessId;
+    } else if (result.meta.executionTrace?.runner === "cli") {
+      next.agentHarnessId = undefined;
+    }
+    if (isCliProvider(providerUsed, cfg)) {
+      const cliSessionBinding = result.meta.agentMeta?.cliSessionBinding;
+      if (cliSessionBinding?.sessionId?.trim()) {
+        setCliSessionBinding(next, providerUsed, cliSessionBinding);
+      } else {
+        const cliSessionId = result.meta.agentMeta?.sessionId?.trim();
+        if (cliSessionId) {
+          setCliSessionId(next, providerUsed, cliSessionId);
+        }
       }
     }
+    next.abortedLastRun = result.meta.aborted ?? false;
+    if (result.meta.systemPromptReport) {
+      next.systemPromptReport = result.meta.systemPromptReport;
+    }
+    if (!preserveRuntimeModel) {
+      next.contextBudgetStatus = contextBudgetStatus;
+    }
   }
-  next.abortedLastRun = result.meta.aborted ?? false;
-  if (result.meta.systemPromptReport) {
-    next.systemPromptReport = result.meta.systemPromptReport;
-  }
-  if (!preserveRuntimeModel) {
-    next.contextBudgetStatus = contextBudgetStatus;
-  }
-  if (hasNonzeroUsage(usage)) {
+  if (hasNonzeroUsage(usage) && !preserveUserFacingRunState) {
     const { estimateUsageCost, resolveModelCostConfig } = await getUsageFormatModule();
     const input = usage.input ?? 0;
     const output = usage.output ?? 0;
@@ -248,10 +252,11 @@ export async function updateSessionEntryAfterAgentRun(params: {
     if (runEstimatedCostUsd !== undefined) {
       next.estimatedCostUsd = runEstimatedCostUsd;
     }
-  } else if (compactionTokensAfter !== undefined) {
+  } else if (compactionTokensAfter !== undefined && !preserveUserFacingRunState) {
     next.totalTokens = compactionTokensAfter;
     next.totalTokensFresh = true;
   } else if (
+    !preserveUserFacingRunState &&
     typeof entry.totalTokens === "number" &&
     Number.isFinite(entry.totalTokens) &&
     entry.totalTokens > 0
@@ -259,10 +264,24 @@ export async function updateSessionEntryAfterAgentRun(params: {
     next.totalTokens = entry.totalTokens;
     next.totalTokensFresh = false;
   }
-  if (compactionsThisRun > 0) {
+  if (compactionsThisRun > 0 && !preserveUserFacingRunState) {
     next.compactionCount = (entry.compactionCount ?? 0) + compactionsThisRun;
   }
-  const metadataPatch = removeLifecycleStateFromMetadataPatch(next);
+  const metadataPatch = preserveUserFacingRunState
+    ? {
+        updatedAt: next.updatedAt,
+        ...(touchInteraction ? { lastInteractionAt: next.lastInteractionAt } : {}),
+      }
+    : removeLifecycleStateFromMetadataPatch(next);
+  if (preserveUserFacingRunState) {
+    const agentId = resolveAgentIdFromSessionKey(sessionKey);
+    if (!agentId) {
+      throw new Error(`Session stores are SQLite-only; cannot resolve agent for ${sessionKey}`);
+    }
+    if (!getSessionEntry({ agentId, sessionKey }) && !sessionStore[sessionKey]) {
+      return;
+    }
+  }
   persistMergedSessionEntry({
     sessionKey,
     sessionStore,
@@ -300,6 +319,8 @@ export async function recordCliCompactionInSessionEntry(params: {
   provider: string;
   sessionKey: string;
   sessionStore?: Record<string, SessionEntry>;
+  tokensAfter?: number;
+  newSessionId?: string;
 }): Promise<SessionEntry | undefined> {
   const { provider, sessionKey, sessionStore } = params;
   const agentId = resolveAgentIdFromSessionKey(sessionKey);
@@ -315,6 +336,30 @@ export async function recordCliCompactionInSessionEntry(params: {
   clearCliSession(next, provider);
   next.compactionCount = (entry.compactionCount ?? 0) + 1;
   next.updatedAt = Date.now();
+  const newSessionId = normalizeOptionalString(params.newSessionId);
+  if (newSessionId && newSessionId !== entry.sessionId) {
+    next.sessionId = newSessionId;
+    next.usageFamilyKey = entry.usageFamilyKey ?? sessionKey;
+    next.usageFamilySessionIds = Array.from(
+      new Set([...(entry.usageFamilySessionIds ?? []), entry.sessionId, newSessionId]),
+    );
+  }
+  const tokensAfterCompaction = resolveNonNegativeNumber(params.tokensAfter);
+  next.contextBudgetStatus = undefined;
+  if (tokensAfterCompaction !== undefined) {
+    next.totalTokens = Math.floor(tokensAfterCompaction);
+    next.totalTokensFresh = true;
+    next.inputTokens = undefined;
+    next.outputTokens = undefined;
+    next.cacheRead = undefined;
+    next.cacheWrite = undefined;
+  } else {
+    next.totalTokensFresh = false;
+    next.inputTokens = undefined;
+    next.outputTokens = undefined;
+    next.cacheRead = undefined;
+    next.cacheWrite = undefined;
+  }
 
   return persistMergedSessionEntry({
     sessionKey,

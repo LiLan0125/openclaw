@@ -30,6 +30,7 @@ import {
 import type { OutboundMediaAccess } from "../../media/load-options.js";
 import { getAgentScopedMediaLocalRoots } from "../../media/local-roots.js";
 import { resolveAgentScopedOutboundMediaAccess } from "../../media/read-capability.js";
+import { stripPlainTextToolCallBlocks } from "../../plugin-sdk/tool-payload.js";
 import { hasPollCreationParams } from "../../poll-params.js";
 import { resolvePollMaxSelections } from "../../polls.js";
 import { resolveFirstBoundAccountId } from "../../routing/bound-account-read.js";
@@ -731,7 +732,60 @@ async function handleInternalSourceReplySendAction(
     to: "current-run",
     handledBy: "internal-source",
     payload,
+    toolResult: buildInternalSourceReplyToolResult(payload),
     dryRun,
+  };
+}
+
+function buildInternalSourceReplyToolResult(payload: {
+  status: string;
+  deliveryStatus: string;
+  channel: ChannelId;
+  target: string;
+  sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
+  sourceReplySink?: "internal-ui";
+  sourceReply: ReplyPayload;
+  message?: string;
+  mediaUrl?: string;
+  mediaUrls?: string[];
+  dryRun: boolean;
+}): AgentToolResult<{
+  status: string;
+  deliveryStatus: string;
+  channel: ChannelId;
+  target: string;
+  sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
+  sourceReplySink?: "internal-ui";
+  sourceReply: ReplyPayload;
+  message?: string;
+  mediaUrl?: string;
+  mediaUrls?: string[];
+  dryRun: boolean;
+}> {
+  const action = payload.dryRun ? "Prepared" : "Sent";
+  const sink = payload.sourceReplySink ? ` via ${payload.sourceReplySink}` : "";
+  return {
+    content: [
+      {
+        type: "text",
+        text: `${action} visible reply to the current webchat conversation${sink}.`,
+      },
+    ],
+    details: {
+      status: payload.status,
+      deliveryStatus: payload.deliveryStatus,
+      channel: payload.channel,
+      target: payload.target,
+      ...(payload.sourceReplyDeliveryMode
+        ? { sourceReplyDeliveryMode: payload.sourceReplyDeliveryMode }
+        : {}),
+      ...(payload.sourceReplySink ? { sourceReplySink: payload.sourceReplySink } : {}),
+      sourceReply: payload.sourceReply,
+      ...(payload.message ? { message: payload.message } : {}),
+      ...(payload.mediaUrl ? { mediaUrl: payload.mediaUrl } : {}),
+      ...(payload.mediaUrls?.length ? { mediaUrls: payload.mediaUrls } : {}),
+      dryRun: payload.dryRun,
+    },
   };
 }
 
@@ -809,7 +863,7 @@ async function buildSendPayloadParts(params: {
   mergedMediaUrls.length = 0;
   mergedMediaUrls.push(...normalizedMediaUrls);
 
-  message = stripUnsupportedCitationControlMarkers(parsed.text);
+  message = stripPlainTextToolCallBlocks(stripUnsupportedCitationControlMarkers(parsed.text));
   actionParams.message = message;
   if (!actionParams.replyTo && parsed.replyToId) {
     actionParams.replyTo = parsed.replyToId;

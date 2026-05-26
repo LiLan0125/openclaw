@@ -134,9 +134,17 @@ const sessionStoreMocks = vi.hoisted(() => ({
     }),
   ),
   resolveSessionRowEntry: vi.fn(
-    (params?: { store?: Record<string, Record<string, unknown>>; sessionKey?: string }) => {
+    (params?: {
+      entries?: Record<string, Record<string, unknown>>;
+      store?: Record<string, Record<string, unknown>>;
+      sessionKey?: string;
+    }) => {
       const existing =
-        params?.sessionKey && params.store ? params.store[params.sessionKey] : undefined;
+        params?.sessionKey && params.entries
+          ? params.entries[params.sessionKey]
+          : params?.sessionKey && params.store
+            ? params.store[params.sessionKey]
+            : undefined;
       return { existing: existing ?? sessionStoreMocks.currentEntry };
     },
   ),

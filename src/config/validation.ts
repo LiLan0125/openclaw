@@ -18,7 +18,7 @@ import {
   resolveOfficialExternalPluginInstall,
 } from "../plugins/official-external-plugin-catalog.js";
 import {
-  loadPluginMetadataSnapshot,
+  resolvePluginMetadataSnapshot,
   type PluginMetadataSnapshot,
 } from "../plugins/plugin-metadata-snapshot.js";
 import { validateJsonSchemaValue } from "../plugins/schema-validator.js";
@@ -1131,10 +1131,11 @@ function validateConfigObjectWithPluginsBase(
       return registryInfo;
     }
     const workspaceDir = resolveAgentWorkspaceDir(config, resolveDefaultAgentId(config));
-    const registry = loadPluginMetadataSnapshot({
+    const registry = resolvePluginMetadataSnapshot({
       config,
       workspaceDir: workspaceDir ?? undefined,
       env: opts.env ?? process.env,
+      allowWorkspaceScopedCurrent: true,
     }).manifestRegistry;
     registryInfo = { registry };
     return registryInfo;

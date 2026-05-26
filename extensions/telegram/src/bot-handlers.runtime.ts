@@ -71,10 +71,8 @@ import type {
   TelegramMessageContextOptions,
   TelegramPromptContextEntry,
 } from "./bot-message-context.types.js";
-import {
-  parseTelegramNativeCommandCallbackData,
-  RegisterTelegramHandlerParams,
-} from "./bot-native-commands.js";
+import { parseTelegramNativeCommandCallbackData } from "./bot-native-commands.js";
+import type { RegisterTelegramHandlerParams } from "./bot-native-commands.js";
 import {
   MEDIA_GROUP_TIMEOUT_MS,
   type MediaGroupEntry,
@@ -91,6 +89,8 @@ import {
   resolveTelegramForumFlag,
   resolveTelegramForumThreadId,
   resolveTelegramGroupAllowFromContext,
+  loadTelegramPairingStoreIfNeeded,
+  TelegramPairingStoreReadError,
   shouldUseTelegramDmThreadSession,
   withResolvedTelegramForumFlag,
 } from "./bot/helpers.js";
@@ -940,7 +940,7 @@ export const registerTelegramHandlers = ({
         date: last.msg.date ?? first.msg.date,
       });
 
-      const storeAllowFrom = await loadStoreAllowFrom();
+      const storeAllowFrom = await loadStoreAllowFrom(first.msg);
       const baseCtx = first.ctx;
 
       const syntheticCtx = buildSyntheticContext(baseCtx, syntheticMessage);
@@ -981,8 +981,29 @@ export const registerTelegramHandlers = ({
     }, TELEGRAM_TEXT_FRAGMENT_MAX_GAP_MS);
   };
 
-  const loadStoreAllowFrom = async () =>
-    telegramDeps.readChannelAllowFromStore("telegram", process.env, accountId).catch(() => []);
+  const loadStoreAllowFrom = async (msg: Message) => {
+    const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+    const { groupConfig, topicConfig } = resolveTelegramGroupConfig(
+      msg.chat.id,
+      msg.message_thread_id,
+    );
+    const groupAllowOverride = firstDefined(topicConfig?.allowFrom, groupConfig?.allowFrom);
+    const effectiveDmPolicy = resolveTelegramEffectiveDmPolicy({
+      isGroup,
+      groupConfig,
+      dmPolicy: telegramCfg.dmPolicy,
+    });
+    return loadTelegramPairingStoreIfNeeded({
+      cfg,
+      allowFrom,
+      groupAllowOverride,
+      accountId,
+      senderId: msg.from?.id != null ? String(msg.from.id) : undefined,
+      isGroup,
+      effectiveDmPolicy,
+      readChannelAllowFromStore: telegramDeps.readChannelAllowFromStore,
+    });
+  };
 
   const recordMessageForReplyChain = (msg: Message, threadId?: number) =>
     messageCache.record({
@@ -1029,19 +1050,19 @@ export const registerTelegramHandlers = ({
     is_reply_target: flags?.replyTarget === true ? true : undefined,
   });
 
-  const buildPromptContextForMessage = (
+  const buildPromptContextForMessage = async (
     msg: Message,
     replyChainNodes: TelegramCachedMessageNode[],
     options?: TelegramMessageContextOptions,
-  ): TelegramPromptContextEntry[] => {
+  ): Promise<TelegramPromptContextEntry[]> => {
     const messageId = typeof msg.message_id === "number" ? String(msg.message_id) : undefined;
-    const currentNode = messageCache.get({
+    const currentNode = await messageCache.get({
       accountId,
       chatId: msg.chat.id,
       messageId,
     });
     const threadId = currentNode?.threadId ? Number(currentNode.threadId) : undefined;
-    const conversationContext = buildTelegramConversationContext({
+    const conversationContext = await buildTelegramConversationContext({
       cache: messageCache,
       messageId,
       accountId,
@@ -1124,12 +1145,12 @@ export const registerTelegramHandlers = ({
   }) => {
     let dispatchDedupeCommitted = false;
     try {
-      const replyChainNodes = buildReplyChainForMessage(params.msg);
+      const replyChainNodes = await buildReplyChainForMessage(params.msg);
       const { replyMedia, replyChain } = await resolveReplyMediaForChain(
         params.ctx,
         replyChainNodes,
       );
-      const promptContext = buildPromptContextForMessage(
+      const promptContext = await buildPromptContextForMessage(
         params.msg,
         replyChainNodes,
         params.options,
@@ -1297,8 +1318,11 @@ export const registerTelegramHandlers = ({
   };
 
   class TelegramRetryableCallbackError extends Error {
-    constructor(public override readonly cause: unknown) {
+    public override readonly cause: unknown;
+
+    constructor(cause: unknown) {
       super(String(cause));
+      this.cause = cause;
       this.name = "TelegramRetryableCallbackError";
     }
   }
@@ -1323,6 +1347,8 @@ export const registerTelegramHandlers = ({
         cfg,
         chatId: params.chatId,
         accountId,
+        dmPolicy: telegramCfg.dmPolicy,
+        allowFrom,
         senderId: params.senderId,
         isGroup: params.isGroup,
         isForum: params.isForum,
@@ -2759,7 +2785,7 @@ export const registerTelegramHandlers = ({
       messageThreadId: normalizedMsg.message_thread_id,
     });
     const dmThreadId = !isGroup ? normalizedMsg.message_thread_id : undefined;
-    recordMessageForReplyChain(normalizedMsg, resolvedThreadId ?? dmThreadId);
+    await recordMessageForReplyChain(normalizedMsg, resolvedThreadId ?? dmThreadId);
   };
 
   const handleInboundMessageLike = async (event: InboundTelegramEvent) => {
@@ -2856,7 +2882,7 @@ export const registerTelegramHandlers = ({
         return;
       }
       dispatchDedupeKeys = dispatchDedupe.keys;
-      recordMessageForReplyChain(event.msg, resolvedThreadId ?? dmThreadId);
+      await recordMessageForReplyChain(event.msg, resolvedThreadId ?? dmThreadId);
       await processInboundMessage({
         ctx: event.ctx,
         msg: event.msg,
@@ -2880,6 +2906,23 @@ export const registerTelegramHandlers = ({
     } catch (err) {
       releaseDispatchDedupeKeys(dispatchDedupeKeys, err);
       runtime.error?.(danger(`${event.errorMessage}: ${String(err)}`));
+      if (err instanceof TelegramPairingStoreReadError) {
+        await withTelegramApiErrorLogging({
+          operation: "sendMessage",
+          runtime,
+          fn: () =>
+            bot.api.sendMessage(
+              event.chatId,
+              "⚠️ Couldn't process this message, please try again in a moment.",
+              {
+                reply_parameters: {
+                  message_id: event.msg.message_id,
+                  allow_sending_without_reply: true,
+                },
+              },
+            ),
+        }).catch(() => {});
+      }
     }
   };
 

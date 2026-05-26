@@ -13,7 +13,7 @@ import { ensureSandboxWorkspaceForSession } from "../../agents/sandbox/context.j
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { readTranscriptStateForSession } from "../../agents/transcript/transcript-state.js";
 import { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
-import type { ReplyPayload } from "../../auto-reply/reply-payload.js";
+import { getReplyPayloadMetadata, type ReplyPayload } from "../../auto-reply/reply-payload.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
 import { stageSandboxMedia } from "../../auto-reply/reply/stage-sandbox-media.js";
 import type { MsgContext, TemplateContext } from "../../auto-reply/templating.js";
@@ -24,6 +24,7 @@ import {
   type SqliteSessionDeliveryContext,
   type SqliteSessionRoutingInfo,
 } from "../../config/sessions/session-entries.sqlite.js";
+import { resolveMirroredTranscriptText } from "../../config/sessions/transcript-mirror.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
   measureDiagnosticsTimelineSpan,
@@ -589,6 +590,18 @@ function hasAssistantDisplayMediaContent(
   content: readonly AssistantDisplayContentBlock[] | undefined,
 ): boolean {
   return Boolean(content?.some((block) => block?.type !== "text"));
+}
+
+function hasManagedOutgoingAssistantContent(
+  content: readonly AssistantDisplayContentBlock[] | undefined,
+): boolean {
+  return Boolean(
+    content?.some(
+      (block) =>
+        block?.type === "image" &&
+        (isManagedOutgoingImageUrl(block.url) || isManagedOutgoingImageUrl(block.openUrl)),
+    ),
+  );
 }
 
 function scheduleChatHistoryManagedImageCleanup(params: {
@@ -1340,6 +1353,125 @@ export function enforceChatHistoryFinalBudget(params: { messages: unknown[]; max
   return { messages: [], placeholderCount: 0 };
 }
 
+type SourceReplyTranscriptScope = {
+  agentId: string;
+  path?: string;
+  sessionId: string;
+};
+
+async function readTranscriptBranchEntries(scope: SourceReplyTranscriptScope) {
+  try {
+    return (await readTranscriptStateForSession(scope)).getBranch();
+  } catch {
+    return [];
+  }
+}
+
+async function findAssistantTranscriptMessageByIdempotencyKey(
+  params: SourceReplyTranscriptScope & { idempotencyKey: string },
+): Promise<{ messageId: string; message: Record<string, unknown> } | null> {
+  const trimmedIdempotencyKey = params.idempotencyKey.trim();
+  if (!trimmedIdempotencyKey) {
+    return null;
+  }
+  const target = (await readTranscriptBranchEntries(params)).toReversed().find((entry) => {
+    if (entry.type !== "message") {
+      return false;
+    }
+    const message = entry.message as Record<string, unknown> | undefined;
+    return message?.role === "assistant" && message.idempotencyKey === trimmedIdempotencyKey;
+  });
+  const message = target?.type === "message" ? (target.message as Record<string, unknown>) : null;
+  if (!target?.id || !message) {
+    return null;
+  }
+  return { messageId: target.id, message };
+}
+
+async function findSourceReplyTranscriptMirrorByIdempotencyKey(
+  params: SourceReplyTranscriptScope & { idempotencyKey: string },
+): Promise<{ messageId: string; message: Record<string, unknown> } | null> {
+  const found = await findAssistantTranscriptMessageByIdempotencyKey(params);
+  if (found?.message.provider !== "openclaw" || found.message.model !== "delivery-mirror") {
+    return null;
+  }
+  return found;
+}
+
+function extractAssistantTranscriptText(message: Record<string, unknown>): string | undefined {
+  const content = message.content;
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const text = content
+    .map((block) =>
+      block &&
+      typeof block === "object" &&
+      (block as { type?: unknown }).type === "text" &&
+      typeof (block as { text?: unknown }).text === "string"
+        ? ((block as { text: string }).text.trim() ?? "")
+        : "",
+    )
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  return text || undefined;
+}
+
+async function findSourceReplyTranscriptMirrorByMetadata(
+  params: SourceReplyTranscriptScope & {
+    idempotencyKey: string;
+    metadata: NonNullable<
+      ReturnType<typeof getReplyPayloadMetadata>
+    >["sourceReplyTranscriptMirror"];
+  },
+): Promise<{ messageId: string; message: Record<string, unknown> } | null> {
+  const byIdempotencyKey = await findSourceReplyTranscriptMirrorByIdempotencyKey(params);
+  if (byIdempotencyKey) {
+    return byIdempotencyKey;
+  }
+  const expectedText = resolveMirroredTranscriptText({
+    text: params.metadata?.text,
+    mediaUrls: params.metadata?.mediaUrls,
+  });
+  if (!expectedText) {
+    return null;
+  }
+  const target = (await readTranscriptBranchEntries(params)).toReversed().find((entry) => {
+    if (entry.type !== "message") {
+      return false;
+    }
+    const message = entry.message as Record<string, unknown> | undefined;
+    return (
+      message?.role === "assistant" &&
+      message.provider === "openclaw" &&
+      message.model === "delivery-mirror" &&
+      extractAssistantTranscriptText(message) === expectedText
+    );
+  });
+  const message = target?.type === "message" ? (target.message as Record<string, unknown>) : null;
+  if (!target?.id || !message) {
+    return null;
+  }
+  return { messageId: target.id, message };
+}
+
+async function canRewriteSourceReplyMirrors(
+  params: SourceReplyTranscriptScope & {
+    allowedSourceReplyMirrorIds: ReadonlySet<string>;
+    rewriteTargetIds: ReadonlySet<string>;
+  },
+): Promise<boolean> {
+  const branch = await readTranscriptBranchEntries(params);
+  const firstRewriteEntryIndex = branch.findIndex((entry) => params.rewriteTargetIds.has(entry.id));
+  return (
+    firstRewriteEntryIndex >= 0 &&
+    branch
+      .slice(firstRewriteEntryIndex)
+      .every((entry) => !entry.id || params.allowedSourceReplyMirrorIds.has(entry.id))
+  );
+}
+
 async function appendAssistantTranscriptMessage(params: {
   message: string;
   label?: string;
@@ -1357,6 +1489,18 @@ async function appendAssistantTranscriptMessage(params: {
   ttsSupplement?: GatewayInjectedTtsSupplementMarker;
   cfg?: OpenClawConfig;
 }): Promise<TranscriptAppendResult> {
+  if (params.idempotencyKey && params.agentId) {
+    const existing = await findAssistantTranscriptMessageByIdempotencyKey({
+      agentId: params.agentId,
+      ...(params.path ? { path: params.path } : {}),
+      sessionId: params.sessionId,
+      idempotencyKey: params.idempotencyKey,
+    });
+    if (existing) {
+      return { ok: true, messageId: existing.messageId, message: existing.message };
+    }
+  }
+
   return await appendInjectedAssistantMessageToTranscript({
     message: params.message,
     ...(params.agentId ? { agentId: params.agentId } : {}),
@@ -1845,6 +1989,10 @@ function broadcastChatError(params: {
   params.context.broadcast("chat", payload);
   params.context.nodeSendToSession(params.sessionKey, "chat", payload);
   params.context.agentRunSeq.delete(params.runId);
+}
+
+function isSourceReplyTranscriptMirrorPayload(payload: ReplyPayload | undefined) {
+  return Boolean(payload && getReplyPayloadMetadata(payload)?.sourceReplyTranscriptMirror);
 }
 
 export const chatHandlers: GatewayRequestHandlers = {
@@ -2564,6 +2712,9 @@ export const chatHandlers: GatewayRequestHandlers = {
         if (!agentRunStarted || appendedWebchatAgentMedia || !isMediaBearingPayload(payload)) {
           return;
         }
+        if (isSourceReplyTranscriptMirrorPayload(payload)) {
+          return;
+        }
         const ttsSupplementMarker = buildTtsSupplementTranscriptMarker(payload);
         const [transcriptPayload] = await normalizeWebchatReplyMediaPathsForDisplay({
           cfg,
@@ -2737,6 +2888,7 @@ export const chatHandlers: GatewayRequestHandlers = {
                   .map((payload) => payload.text?.trim())
                   .filter((text): text is string => Boolean(text))
                   .join(" | ") || undefined;
+              let broadcastedSourceReplyFinal = false;
               // WebChat persistence has two owners. Agent runs persist model-visible turns
               // through OpenClaw's transcript manager; this dispatcher only owns live delivery payloads.
               // Do not blindly mirror agent-run final payloads into the transcript or chat.history
@@ -2923,7 +3075,315 @@ export const chatHandlers: GatewayRequestHandlers = {
                     message,
                   });
                 }
-              } else if (returnedAgentErrorPayloads.length > 0) {
+              } else {
+                const sourceReplyPayloads = deliveredReplies
+                  .filter((entry) => entry.kind === "final")
+                  .map((entry) => entry.payload)
+                  .filter(isSourceReplyTranscriptMirrorPayload);
+                if (sourceReplyPayloads.length > 0) {
+                  const finalPayloads = await normalizeWebchatReplyMediaPathsForDisplay({
+                    cfg,
+                    sessionKey,
+                    agentId,
+                    accountId,
+                    payloads: sourceReplyPayloads,
+                  });
+                  const { databasePath: latestDatabasePath, entry: latestEntry } =
+                    loadSessionEntry(sessionKey);
+                  const sessionId = latestEntry?.sessionId ?? backingSessionId ?? clientRunId;
+                  const transcriptScope: SourceReplyTranscriptScope = {
+                    agentId,
+                    path: latestDatabasePath,
+                    sessionId,
+                  };
+                  const mediaLocalRoots = appendLocalMediaParentRoots(
+                    getAgentScopedMediaLocalRoots(cfg, agentId),
+                    latestDatabasePath ? [latestDatabasePath] : undefined,
+                  );
+                  const buildReplyAssistantContent = async (
+                    payloads: typeof finalPayloads,
+                  ): Promise<AssistantDisplayContentBlock[] | undefined> =>
+                    await buildAssistantDisplayContentFromReplyPayloads({
+                      sessionKey,
+                      payloads,
+                      managedImageLocalRoots: mediaLocalRoots,
+                      includeSensitiveMedia: false,
+                      onLocalAudioAccessDenied: (message) => {
+                        context.logGateway.warn(
+                          `webchat audio embedding denied local path: ${message}`,
+                        );
+                      },
+                      onManagedImagePrepareError: (message) => {
+                        context.logGateway.warn(
+                          `webchat image embedding skipped attachment: ${message}`,
+                        );
+                      },
+                    });
+                  const buildReplyMediaMessage = async (payloads: typeof finalPayloads) =>
+                    await buildWebchatAssistantMediaMessage(payloads, {
+                      localRoots: mediaLocalRoots,
+                      onLocalAudioAccessDenied: (message) => {
+                        context.logGateway.warn(
+                          `webchat audio embedding denied local path: ${message}`,
+                        );
+                      },
+                    });
+                  const combinedAssistantContent =
+                    sourceReplyPayloads.length === 1
+                      ? await buildReplyAssistantContent(finalPayloads)
+                      : undefined;
+                  const combinedMediaMessage =
+                    sourceReplyPayloads.length === 1
+                      ? await buildReplyMediaMessage(finalPayloads)
+                      : undefined;
+                  type SourceReplyContentState = {
+                    broadcastContent: AssistantDisplayContentBlock[];
+                    persistedContent: AssistantDisplayContentBlock[];
+                    hasManagedOutgoingContent: boolean;
+                    backedManagedOutgoingContent: boolean;
+                  };
+                  const sourceReplyContentStates: SourceReplyContentState[] = [];
+                  const sourceReplyBroadcastContent: AssistantDisplayContentBlock[] = [];
+                  for (const [replyIndex] of sourceReplyPayloads.entries()) {
+                    const finalPayload = finalPayloads[replyIndex];
+                    if (!finalPayload) {
+                      continue;
+                    }
+                    const replyAssistantContent =
+                      sourceReplyPayloads.length === 1
+                        ? combinedAssistantContent
+                        : await buildReplyAssistantContent([finalPayload]);
+                    const replyMediaMessage =
+                      sourceReplyPayloads.length === 1
+                        ? combinedMediaMessage
+                        : await buildReplyMediaMessage([finalPayload]);
+                    const replyBroadcastContent = hasAssistantDisplayMediaContent(
+                      replyAssistantContent,
+                    )
+                      ? replyAssistantContent
+                      : hasAssistantDisplayMediaContent(replyMediaMessage?.content)
+                        ? replyMediaMessage?.content
+                        : replyAssistantContent;
+                    const persistedContent = hasAssistantDisplayMediaContent(replyAssistantContent)
+                      ? replaceAssistantContentTextBlocks(
+                          replyAssistantContent,
+                          replyMediaMessage ?? null,
+                        )
+                      : hasAssistantDisplayMediaContent(replyMediaMessage?.content)
+                        ? replaceAssistantContentTextBlocks(
+                            replyMediaMessage?.content as AssistantDisplayContentBlock[],
+                            replyAssistantContent ? { content: replyAssistantContent } : null,
+                          )
+                        : replaceAssistantContentTextBlocks(
+                            replyAssistantContent,
+                            replyMediaMessage ?? null,
+                          );
+                    const state: SourceReplyContentState = {
+                      broadcastContent: replyBroadcastContent ? [...replyBroadcastContent] : [],
+                      persistedContent: persistedContent ? [...persistedContent] : [],
+                      hasManagedOutgoingContent:
+                        hasManagedOutgoingAssistantContent(persistedContent),
+                      backedManagedOutgoingContent: false,
+                    };
+                    sourceReplyContentStates[replyIndex] = state;
+                    if (state.broadcastContent.length > 0) {
+                      sourceReplyBroadcastContent.push(...state.broadcastContent);
+                    }
+                  }
+
+                  const displayReply =
+                    extractAssistantDisplayTextFromContent(sourceReplyBroadcastContent) ??
+                    buildTranscriptReplyText(finalPayloads);
+                  if (sourceReplyBroadcastContent.length || displayReply) {
+                    const sourceReplyPersistenceRequests: Array<{
+                      idempotencyKey: string;
+                      metadata: NonNullable<
+                        ReturnType<typeof getReplyPayloadMetadata>
+                      >["sourceReplyTranscriptMirror"];
+                      state: SourceReplyContentState;
+                    }> = [];
+                    for (const [replyIndex, sourceReplyPayload] of sourceReplyPayloads.entries()) {
+                      const state = sourceReplyContentStates[replyIndex];
+                      if (!state || !hasAssistantDisplayMediaContent(state.persistedContent)) {
+                        continue;
+                      }
+                      const mirrorMetadata =
+                        getReplyPayloadMetadata(sourceReplyPayload)?.sourceReplyTranscriptMirror;
+                      const mirrorIdempotencyKey = mirrorMetadata?.idempotencyKey;
+                      if (
+                        typeof mirrorIdempotencyKey !== "string" ||
+                        mirrorIdempotencyKey.trim().length === 0
+                      ) {
+                        continue;
+                      }
+                      if (!state.hasManagedOutgoingContent) {
+                        state.backedManagedOutgoingContent = true;
+                      }
+                      sourceReplyPersistenceRequests.push({
+                        idempotencyKey: mirrorIdempotencyKey,
+                        metadata: mirrorMetadata,
+                        state,
+                      });
+                    }
+
+                    const attachSourceReplyManagedImages = async (params: {
+                      messageId?: string;
+                      request: (typeof sourceReplyPersistenceRequests)[number];
+                    }) => {
+                      if (!params.request.state.hasManagedOutgoingContent) {
+                        params.request.state.backedManagedOutgoingContent = true;
+                        return;
+                      }
+                      if (!params.messageId) {
+                        return;
+                      }
+                      await attachManagedOutgoingImagesToMessage({
+                        messageId: params.messageId,
+                        blocks: params.request.state.persistedContent,
+                      });
+                      params.request.state.backedManagedOutgoingContent = true;
+                    };
+
+                    if (sourceReplyPersistenceRequests.length > 0) {
+                      const allowedSourceReplyMirrorIds = new Set<string>();
+                      for (const [
+                        replyIndex,
+                        sourceReplyPayload,
+                      ] of sourceReplyPayloads.entries()) {
+                        if (!sourceReplyContentStates[replyIndex]) {
+                          continue;
+                        }
+                        const mirrorIdempotencyKey =
+                          getReplyPayloadMetadata(sourceReplyPayload)?.sourceReplyTranscriptMirror
+                            ?.idempotencyKey;
+                        const mirrorMetadata =
+                          getReplyPayloadMetadata(sourceReplyPayload)?.sourceReplyTranscriptMirror;
+                        if (
+                          typeof mirrorIdempotencyKey !== "string" ||
+                          mirrorIdempotencyKey.trim().length === 0 ||
+                          !mirrorMetadata
+                        ) {
+                          continue;
+                        }
+                        const target = await findSourceReplyTranscriptMirrorByMetadata({
+                          ...transcriptScope,
+                          idempotencyKey: mirrorIdempotencyKey,
+                          metadata: mirrorMetadata,
+                        });
+                        if (target) {
+                          allowedSourceReplyMirrorIds.add(target.messageId);
+                        }
+                      }
+                      const rewriteTargets: Array<{
+                        request: (typeof sourceReplyPersistenceRequests)[number];
+                        messageId: string;
+                        message: Record<string, unknown>;
+                      }> = [];
+                      for (const request of sourceReplyPersistenceRequests) {
+                        const target = await findSourceReplyTranscriptMirrorByMetadata({
+                          ...transcriptScope,
+                          idempotencyKey: request.idempotencyKey,
+                          metadata: request.metadata,
+                        });
+                        if (target) {
+                          rewriteTargets.push({ request, ...target });
+                        }
+                      }
+
+                      if (rewriteTargets.length > 0) {
+                        const rewriteTargetIds = new Set(
+                          rewriteTargets.map((target) => target.messageId),
+                        );
+                        const canRewriteMirrors = await canRewriteSourceReplyMirrors({
+                          ...transcriptScope,
+                          allowedSourceReplyMirrorIds,
+                          rewriteTargetIds,
+                        });
+                        if (canRewriteMirrors) {
+                          const result = await rewriteTranscriptEntriesInSqliteTranscript({
+                            agentId,
+                            path: latestDatabasePath,
+                            sessionId,
+                            sessionKey,
+                            config: cfg,
+                            request: {
+                              allowedRewriteSuffixEntryIds: [...allowedSourceReplyMirrorIds],
+                              replacements: rewriteTargets.map((target) => ({
+                                entryId: target.messageId,
+                                message: {
+                                  ...(target.message as unknown as AgentMessage),
+                                  idempotencyKey: target.request.idempotencyKey,
+                                  content: target.request.state.persistedContent,
+                                } as unknown as AgentMessage,
+                              })),
+                            },
+                          });
+                          for (const target of rewriteTargets) {
+                            target.request.state.backedManagedOutgoingContent = true;
+                          }
+                          if (result.changed) {
+                            for (const target of rewriteTargets) {
+                              const rewritten =
+                                await findSourceReplyTranscriptMirrorByIdempotencyKey({
+                                  ...transcriptScope,
+                                  idempotencyKey: target.request.idempotencyKey,
+                                });
+                              await attachSourceReplyManagedImages({
+                                messageId: rewritten?.messageId ?? target.messageId,
+                                request: target.request,
+                              });
+                            }
+                          }
+                        }
+                      }
+                    }
+                    const sourceReplyContent = sourceReplyContentStates
+                      .flatMap((state) => {
+                        if (
+                          state.hasManagedOutgoingContent &&
+                          !state.backedManagedOutgoingContent
+                        ) {
+                          const stripped = stripManagedOutgoingAssistantContentBlocks(
+                            state.broadcastContent,
+                          );
+                          return stripped?.length
+                            ? stripped
+                            : [{ type: "text", text: "Media reply could not be displayed." }];
+                        }
+                        return state.broadcastContent;
+                      })
+                      .filter((block): block is AssistantDisplayContentBlock => Boolean(block));
+                    const sourceReplyTextFromContent =
+                      extractAssistantDisplayTextFromContent(sourceReplyContent);
+                    const sourceReplyText =
+                      sourceReplyTextFromContent ??
+                      (sourceReplyContent.length === 0 ? displayReply : undefined);
+                    const now = Date.now();
+                    const message = {
+                      role: "assistant",
+                      ...(sourceReplyContent?.length
+                        ? { content: sourceReplyContent }
+                        : sourceReplyText
+                          ? { content: [{ type: "text", text: sourceReplyText }] }
+                          : {}),
+                      ...(sourceReplyText ? { text: sourceReplyText } : {}),
+                      timestamp: now,
+                      stopReason: "stop",
+                      usage: { input: 0, output: 0, totalTokens: 0 },
+                    };
+                    broadcastChatFinal({
+                      context,
+                      runId: clientRunId,
+                      sessionKey,
+                      message,
+                    });
+                    broadcastedSourceReplyFinal = true;
+                  }
+                }
+              }
+              const shouldBroadcastAgentError =
+                returnedAgentErrorPayloads.length > 0 && !broadcastedSourceReplyFinal;
+              if (shouldBroadcastAgentError) {
                 if (!hasBeforeAgentRunGate) {
                   await emitUserTranscriptUpdateAfterAgentRun();
                 }
@@ -2937,27 +3397,25 @@ export const chatHandlers: GatewayRequestHandlers = {
                 await emitUserTranscriptUpdateAfterAgentRun();
               }
               if (!context.chatAbortedRuns.has(clientRunId)) {
-                const returnedAgentError =
-                  returnedAgentErrorPayloads.length > 0
-                    ? errorShape(
-                        ErrorCodes.UNAVAILABLE,
-                        returnedAgentErrorMessage ?? "agent returned an error payload",
-                      )
-                    : undefined;
+                const returnedAgentError = shouldBroadcastAgentError
+                  ? errorShape(
+                      ErrorCodes.UNAVAILABLE,
+                      returnedAgentErrorMessage ?? "agent returned an error payload",
+                    )
+                  : undefined;
                 setGatewayDedupeEntry({
                   dedupe: context.dedupe,
                   key: `chat:${clientRunId}`,
                   entry: {
                     ts: Date.now(),
-                    ok: returnedAgentErrorPayloads.length === 0,
-                    payload:
-                      returnedAgentErrorPayloads.length > 0
-                        ? {
-                            runId: clientRunId,
-                            status: "error" as const,
-                            summary: returnedAgentErrorMessage ?? "agent returned an error payload",
-                          }
-                        : { runId: clientRunId, status: "ok" as const },
+                    ok: !shouldBroadcastAgentError,
+                    payload: shouldBroadcastAgentError
+                      ? {
+                          runId: clientRunId,
+                          status: "error" as const,
+                          summary: returnedAgentErrorMessage ?? "agent returned an error payload",
+                        }
+                      : { runId: clientRunId, status: "ok" as const },
                     ...(returnedAgentError ? { error: returnedAgentError } : {}),
                   },
                 });
@@ -3033,6 +3491,12 @@ export const chatHandlers: GatewayRequestHandlers = {
       respond(false, payload, error, {
         runId: clientRunId,
         error: formatForLog(err),
+      });
+      broadcastChatError({
+        context,
+        runId: clientRunId,
+        sessionKey,
+        errorMessage: String(err),
       });
     }
   },

@@ -172,6 +172,25 @@ export type ChannelDoctorLegacyStateMigrationFilePlan = {
   targetPath: string;
 };
 
+export type ChannelLegacyStateMigrationPlan =
+  | ChannelDoctorLegacyStateMigrationFilePlan
+  | {
+      kind: "plugin-state-import";
+      label: string;
+      sourcePath: string;
+      targetPath: string;
+      pluginId: string;
+      namespace: string;
+      maxEntries: number;
+      scopeKey: string;
+      stateDir?: string;
+      cleanupSource?: "rename";
+      preview?: string;
+      readEntries: () =>
+        | Array<{ key: string; value: unknown }>
+        | Promise<Array<{ key: string; value: unknown }>>;
+    };
+
 export type ChannelDoctorLegacyStateMigrationCustomPlan = {
   kind: "custom";
   label: string;

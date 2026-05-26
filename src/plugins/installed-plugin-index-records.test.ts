@@ -7,6 +7,7 @@ import type { PluginInstallRecord } from "../config/types.plugins.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import type { PluginCandidate } from "./discovery.js";
 import {
+  clearLoadInstalledPluginIndexInstallRecordsCache,
   loadInstalledPluginIndexInstallRecords,
   loadInstalledPluginIndexInstallRecordsSync,
   hasPendingPluginInstallRecords,
@@ -16,6 +17,7 @@ import {
   removePluginInstallRecordFromRecords,
   withoutPluginInstallRecords,
   writePersistedInstalledPluginIndexInstallRecords,
+  writePersistedInstalledPluginIndexInstallRecordsSync,
 } from "./installed-plugin-index-records.js";
 import {
   readPersistedInstalledPluginIndex,
@@ -74,6 +76,7 @@ function requireInstalledPluginIndex(index: InstalledPluginIndex | null): Instal
 
 afterEach(() => {
   closeOpenClawStateDatabaseForTest();
+  clearLoadInstalledPluginIndexInstallRecordsCache();
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -182,6 +185,110 @@ describe("plugin index install records store", () => {
     });
   });
 
+  it("returns cloned cached records", async () => {
+    const stateDir = makeStateDir();
+    const candidate = createPluginCandidate(stateDir, "cached");
+    await writePersistedInstalledPluginIndexInstallRecords(
+      {
+        cached: {
+          source: "npm",
+          spec: "cached@1.0.0",
+        },
+      },
+      { stateDir, candidates: [candidate] },
+    );
+
+    const first = loadInstalledPluginIndexInstallRecordsSync({ stateDir });
+    first.cached.spec = "mutated@1.0.0";
+
+    expect(loadInstalledPluginIndexInstallRecordsSync({ stateDir })).toEqual({
+      cached: {
+        source: "npm",
+        spec: "cached@1.0.0",
+      },
+    });
+  });
+
+  it("invalidates cached records when the persisted index is rewritten", () => {
+    const stateDir = makeStateDir();
+    const first = createPluginCandidate(stateDir, "first");
+    writePersistedInstalledPluginIndexInstallRecordsSync(
+      {
+        first: {
+          source: "npm",
+          spec: "first@1.0.0",
+        },
+      },
+      { stateDir, candidates: [first] },
+    );
+    expect(loadInstalledPluginIndexInstallRecordsSync({ stateDir })).toEqual({
+      first: {
+        source: "npm",
+        spec: "first@1.0.0",
+      },
+    });
+
+    const second = createPluginCandidate(stateDir, "second");
+    writePersistedInstalledPluginIndexInstallRecordsSync(
+      {
+        second: {
+          source: "npm",
+          spec: "second@1.0.0",
+        },
+      },
+      { stateDir, candidates: [second] },
+    );
+
+    expect(loadInstalledPluginIndexInstallRecordsSync({ stateDir })).toEqual({
+      second: {
+        source: "npm",
+        spec: "second@1.0.0",
+      },
+    });
+  });
+
+  it("reloads cached records after an external index write", async () => {
+    const stateDir = makeStateDir();
+    const candidate = createPluginCandidate(stateDir, "external");
+    writePersistedInstalledPluginIndexInstallRecordsSync(
+      {
+        external: {
+          source: "npm",
+          spec: "external@1.0.0",
+        },
+      },
+      { stateDir, candidates: [candidate] },
+    );
+    expect(loadInstalledPluginIndexInstallRecordsSync({ stateDir })).toEqual({
+      external: {
+        source: "npm",
+        spec: "external@1.0.0",
+      },
+    });
+
+    const persisted = requireInstalledPluginIndex(
+      await readPersistedInstalledPluginIndex({ stateDir }),
+    );
+    writePersistedInstalledPluginIndexSync(
+      {
+        ...persisted,
+        installRecords: {
+          external: {
+            source: "npm",
+            spec: "external-plugin@2.0.0",
+          },
+        },
+      },
+      { stateDir },
+    );
+
+    expect(loadInstalledPluginIndexInstallRecordsSync({ stateDir })).toEqual({
+      external: {
+        source: "npm",
+        spec: "external-plugin@2.0.0",
+      },
+    });
+  });
   it("recovers managed npm plugin records when the persisted ledger is empty", async () => {
     const stateDir = makeStateDir();
     const discordDir = writeManagedNpmPlugin({
@@ -297,6 +404,46 @@ describe("plugin index install records store", () => {
     expectRecordFields(loadedSync.codex, {
       version: "2026.5.18-beta.1",
       resolvedVersion: "2026.5.18-beta.1",
+    });
+  });
+
+  it("reloads recovered managed npm records after package manifest changes", () => {
+    const stateDir = makeStateDir();
+    const codexDir = writeManagedNpmPlugin({
+      stateDir,
+      packageName: "@openclaw/codex",
+      pluginId: "codex",
+      version: "2026.5.18-beta.1",
+    });
+
+    expectRecordFields(loadInstalledPluginIndexInstallRecordsSync({ stateDir }).codex, {
+      source: "npm",
+      spec: "@openclaw/codex@2026.5.18-beta.1",
+      installPath: codexDir,
+      version: "2026.5.18-beta.1",
+    });
+
+    const packagePath = path.join(codexDir, "package.json");
+    const packageManifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    fs.writeFileSync(
+      packagePath,
+      JSON.stringify({
+        ...packageManifest,
+        version: "2026.5.19-beta.1",
+      }),
+      "utf8",
+    );
+
+    expectRecordFields(loadInstalledPluginIndexInstallRecordsSync({ stateDir }).codex, {
+      source: "npm",
+      spec: "@openclaw/codex@2026.5.18-beta.1",
+      installPath: codexDir,
+      version: "2026.5.19-beta.1",
+      resolvedVersion: "2026.5.19-beta.1",
+      resolvedSpec: "@openclaw/codex@2026.5.19-beta.1",
     });
   });
 

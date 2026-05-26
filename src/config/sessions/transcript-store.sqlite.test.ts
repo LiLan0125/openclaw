@@ -934,6 +934,42 @@ describe("SQLite session transcript store", () => {
     ).toEqual({ count: 0 });
   });
 
+  it("deletes hidden transcript roots without session entries", () => {
+    const stateDir = createTempDir();
+    const env = { OPENCLAW_STATE_DIR: stateDir };
+
+    appendSqliteSessionTranscriptEvent({
+      env,
+      agentId: "main",
+      sessionId: "internal-agent-run:test-run",
+      event: { type: "session", id: "internal-agent-run:test-run" },
+    });
+
+    const agentDatabase = openOpenClawAgentDatabase({ env, agentId: "main" });
+    const db = getNodeSqliteKysely<TranscriptStoreTestDatabase>(agentDatabase.db);
+    expect(
+      executeSqliteQueryTakeFirstSync(
+        agentDatabase.db,
+        db.selectFrom("sessions").select((eb) => eb.fn.countAll<number>().as("count")),
+      ),
+    ).toEqual({ count: 1 });
+
+    expect(
+      deleteSqliteSessionTranscript({
+        env,
+        agentId: "main",
+        sessionId: "internal-agent-run:test-run",
+      }),
+    ).toBe(true);
+
+    expect(
+      executeSqliteQueryTakeFirstSync(
+        agentDatabase.db,
+        db.selectFrom("sessions").select((eb) => eb.fn.countAll<number>().as("count")),
+      ),
+    ).toEqual({ count: 0 });
+  });
+
   it("anchors transcript rows to the canonical session root", () => {
     const stateDir = createTempDir();
     const env = { OPENCLAW_STATE_DIR: stateDir };

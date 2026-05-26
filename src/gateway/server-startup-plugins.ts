@@ -45,6 +45,7 @@ export async function prepareGatewayPluginBootstrap(params: {
           ...(params.pluginMetadataSnapshot?.manifestRegistry
             ? { manifestRegistry: params.pluginMetadataSnapshot.manifestRegistry }
             : {}),
+          discovery: params.pluginMetadataSnapshot?.discovery,
         }).config,
       });
   const pluginsGloballyDisabled = gatewayPluginConfig.plugins?.enabled === false;

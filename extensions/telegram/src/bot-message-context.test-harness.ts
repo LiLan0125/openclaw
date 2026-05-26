@@ -1,5 +1,6 @@
 import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
 import type { BuildTelegramMessageContextParams, TelegramMediaRef } from "./bot-message-context.js";
+import { setTelegramTopicNameStoreFactoryForTest } from "./topic-name-cache.js";
 
 export const baseTelegramMessageContextConfig = {
   agents: { defaults: { model: "anthropic/claude-opus-4-5", workspace: "/tmp/openclaw" } },
@@ -8,6 +9,13 @@ export const baseTelegramMessageContextConfig = {
 } as never;
 
 type TelegramTestSessionRuntime = NonNullable<BuildTelegramMessageContextParams["sessionRuntime"]>;
+type TopicNameEntryForTest = {
+  name: string;
+  iconColor?: number;
+  iconCustomEmojiId?: string;
+  closed?: boolean;
+  updatedAt: number;
+};
 
 type BuildTelegramMessageContextForTestParams = {
   message: Record<string, unknown>;
@@ -26,14 +34,39 @@ type BuildTelegramMessageContextForTestParams = {
   resolveTelegramGroupConfig?: BuildTelegramMessageContextParams["resolveTelegramGroupConfig"];
 };
 
-const telegramMessageContextSessionRuntimeForTest = {
-  buildChannelInboundEventContext,
-  readSessionUpdatedAt: () => undefined,
-  recordInboundSession: async () => undefined,
-  resolveInboundLastRouteSessionKey: ({ route, sessionKey }) =>
-    route.lastRoutePolicy === "main" ? route.mainSessionKey : sessionKey,
-  resolvePinnedMainDmOwnerFromAllowlist: () => null,
-} satisfies NonNullable<BuildTelegramMessageContextParams["sessionRuntime"]>;
+const telegramTopicNameStoresForTest = new Map<string, Map<string, TopicNameEntryForTest>>();
+
+function createTelegramMessageContextSessionRuntimeForTest(): TelegramTestSessionRuntime {
+  return {
+    buildChannelInboundEventContext,
+    readSessionUpdatedAt: () => undefined,
+    recordInboundSession: async () => undefined,
+    resolveInboundLastRouteSessionKey: ({ route, sessionKey }) =>
+      route.lastRoutePolicy === "main" ? route.mainSessionKey : sessionKey,
+    resolvePinnedMainDmOwnerFromAllowlist: () => null,
+  };
+}
+
+function installTelegramTopicNameStoreForTest() {
+  setTelegramTopicNameStoreFactoryForTest((namespace) => {
+    const entries = telegramTopicNameStoresForTest.get(namespace) ?? new Map();
+    telegramTopicNameStoresForTest.set(namespace, entries);
+    return {
+      async register(key, value) {
+        entries.set(key, value);
+      },
+      async entries() {
+        return Array.from(entries, ([key, value]) => ({ key, value }));
+      },
+      async delete(key) {
+        return entries.delete(key);
+      },
+      async clear() {
+        entries.clear();
+      },
+    };
+  });
+}
 
 export async function buildTelegramMessageContextForTest(
   params: BuildTelegramMessageContextForTestParams,
@@ -46,7 +79,7 @@ export async function buildTelegramMessageContextForTest(
     params.sessionRuntime === null
       ? undefined
       : {
-          ...telegramMessageContextSessionRuntimeForTest,
+          ...createTelegramMessageContextSessionRuntimeForTest(),
           ...params.sessionRuntime,
         };
   return await buildTelegramMessageContext({
@@ -122,4 +155,5 @@ async function installMessageContextTestMocks() {
     return;
   }
   messageContextMocksInstalled = true;
+  installTelegramTopicNameStoreForTest();
 }

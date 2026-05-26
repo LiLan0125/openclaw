@@ -2,7 +2,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { URL } from "node:url";
 import { isWindowsDrivePath } from "../infra/archive-path.js";
-import { root as fsRoot, FsSafeError } from "../infra/fs-safe.js";
+import {
+  canonicalPathFromExistingAncestor,
+  root as fsRoot,
+  FsSafeError,
+} from "../infra/fs-safe.js";
 import { expandHomePrefix, resolveOsHomeDir } from "../infra/home-dir.js";
 import { hasEncodedFileUrlSeparator, trySafeFileURLToPath } from "../infra/local-file-access.js";
 import { detectMime } from "../media/mime.js";
@@ -951,7 +955,7 @@ function createHostWriteOperations(root: string, options?: { workspaceOnly?: boo
       await fs.mkdir(resolved, { recursive: true });
     },
     writeFile: async (absolutePath: string, content: string) => {
-      const relative = toRelativeWorkspacePath(root, absolutePath);
+      const relative = await toCanonicalRelativeWorkspacePath(root, absolutePath);
       await (await rootPromise).write(relative, content, { mkdir: true });
     },
   } as const;
@@ -984,7 +988,7 @@ function createHostEditOperations(root: string, options?: { workspaceOnly?: bool
       return safeRead.buffer;
     },
     writeFile: async (absolutePath: string, content: string) => {
-      const relative = toRelativeWorkspacePath(root, absolutePath);
+      const relative = await toCanonicalRelativeWorkspacePath(root, absolutePath);
       await (await rootPromise).write(relative, content, { mkdir: true });
     },
     access: async (absolutePath: string) => {
@@ -1173,6 +1177,21 @@ function createWorkspaceScratchOverlayEditOperations(
       await hostOps.access(absolutePath);
     },
   } as const;
+}
+
+async function toCanonicalRelativeWorkspacePath(
+  root: string,
+  absolutePath: string,
+): Promise<string> {
+  const lexicalRelative = toRelativeWorkspacePath(root, absolutePath);
+  const lexicalPath = path.resolve(root, lexicalRelative);
+  const parentPath = path.dirname(lexicalPath);
+  const [rootReal, canonicalParentPath] = await Promise.all([
+    fs.realpath(root),
+    canonicalPathFromExistingAncestor(parentPath),
+  ]);
+  const canonicalPath = path.join(canonicalParentPath, path.basename(lexicalPath));
+  return toRelativeWorkspacePath(rootReal, canonicalPath);
 }
 
 function createFsAccessError(code: string, filePath: string): NodeJS.ErrnoException {

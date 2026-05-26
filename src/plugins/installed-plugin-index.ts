@@ -1,8 +1,10 @@
 import type { OpenClawConfig } from "../config/types.js";
 import { normalizePluginsConfig, resolveEffectivePluginActivationState } from "./config-state.js";
 import { isPluginEnabledByDefaultForPlatform } from "./default-enablement.js";
+import type { PluginDiscoveryResult } from "./discovery.js";
 import { buildInstalledPluginIndex } from "./installed-plugin-index-build.js";
 import { loadInstalledPluginIndexInstallRecordsSync } from "./installed-plugin-index-record-reader.js";
+import { resolveInstalledPluginIndexRegistry } from "./installed-plugin-index-registry.js";
 import {
   type InstalledPluginIndex,
   type InstalledPluginIndexRecord,
@@ -42,6 +44,31 @@ export function loadInstalledPluginIndex(
         ...(params.stateDir ? { stateDir: params.stateDir } : {}),
       }),
   });
+}
+
+export function loadInstalledPluginIndexWithDiscovery(
+  params: LoadInstalledPluginIndexParams = {},
+): { index: InstalledPluginIndex; discovery: PluginDiscoveryResult | undefined } {
+  const env = params.env ?? process.env;
+  const installRecords =
+    params.installRecords ??
+    loadInstalledPluginIndexInstallRecordsSync({
+      env,
+      ...(params.stateDir ? { stateDir: params.stateDir } : {}),
+    });
+  const resolved = resolveInstalledPluginIndexRegistry({
+    ...params,
+    installRecords,
+  });
+  return {
+    discovery: resolved.discovery,
+    index: buildInstalledPluginIndex({
+      ...params,
+      candidates: resolved.candidates,
+      diagnostics: resolved.registry.diagnostics,
+      installRecords,
+    }),
+  };
 }
 
 export function refreshInstalledPluginIndex(

@@ -247,7 +247,7 @@ function waitForSessionsChangedMessagePhase(ws: GatewayWs, sessionKey: string) {
   );
 }
 
-async function emitTranscriptUpdateAndCollectEvents(params: {
+async function emitTranscriptUpdateAndCollectMessageEvent(params: {
   ws: GatewayWs;
   sessionKey: string;
   sessionId: string;
@@ -256,7 +256,6 @@ async function emitTranscriptUpdateAndCollectEvents(params: {
   messageSeq?: number;
 }) {
   const messageEventPromise = waitForSessionMessageEvent(params.ws, params.sessionKey);
-  const changedEventPromise = waitForSessionsChangedMessagePhase(params.ws, params.sessionKey);
 
   await emitTranscriptUpdate({
     agentId: "main",
@@ -267,11 +266,8 @@ async function emitTranscriptUpdateAndCollectEvents(params: {
     ...(typeof params.messageSeq === "number" ? { messageSeq: params.messageSeq } : {}),
   });
 
-  const [messageEvent, changedEvent] = await Promise.all([
-    messageEventPromise,
-    changedEventPromise,
-  ]);
-  return { messageEvent, changedEvent };
+  const messageEvent = await messageEventPromise;
+  return { messageEvent };
 }
 
 async function expectNoMessageWithin(params: {
@@ -478,7 +474,7 @@ describe("session.message websocket events", () => {
     });
 
     await withOperatorSessionSubscriber(async (ws) => {
-      const { messageEvent } = await emitTranscriptUpdateAndCollectEvents({
+      const { messageEvent } = await emitTranscriptUpdateAndCollectMessageEvent({
         ws,
         sessionKey: "agent:main:main",
         sessionId: "sess-main",
@@ -602,7 +598,61 @@ describe("session.message websocket events", () => {
     });
   });
 
-  test("includes live usage metadata on session.message and sessions.changed transcript events", async () => {
+  test("does not duplicate displayable transcript updates with sessions.changed", async () => {
+    await setupTranscriptFixtureState();
+    await seedGatewaySessionEntries({
+      entries: {
+        main: {
+          sessionId: "sess-main",
+          updatedAt: Date.now(),
+        },
+      },
+    });
+    await replaceTranscriptEvents({
+      sessionId: "sess-main",
+      events: [{ type: "session", version: 1, id: "sess-main" }],
+    });
+
+    await withOperatorSessionSubscriber(async (ws) => {
+      const messageEventPromise = waitForSessionMessageEvent(ws, "agent:main:main");
+      await expectNoMessageWithin({
+        action: async () => {
+          await emitTranscriptUpdate({
+            agentId: "main",
+            sessionId: "sess-main",
+            sessionKey: "agent:main:main",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "single frame" }],
+              timestamp: Date.now(),
+            },
+            messageId: "msg-single-frame",
+            messageSeq: 1,
+          });
+        },
+        watch: (timeoutMs) =>
+          onceMessage(
+            ws,
+            (message) =>
+              message.type === "event" &&
+              message.event === "sessions.changed" &&
+              (message.payload as { phase?: string; sessionKey?: string } | undefined)?.phase ===
+                "message" &&
+              (message.payload as { sessionKey?: string } | undefined)?.sessionKey ===
+                "agent:main:main",
+            timeoutMs,
+          ),
+      });
+      const messageEvent = await messageEventPromise;
+      expectRecordFields(messageEvent.payload, {
+        sessionKey: "agent:main:main",
+        messageId: "msg-single-frame",
+        messageSeq: 1,
+      });
+    });
+  });
+
+  test("includes live usage metadata on session.message transcript events", async () => {
     await setupTranscriptFixtureState();
     await seedGatewaySessionEntries({
       entries: {
@@ -640,7 +690,7 @@ describe("session.message websocket events", () => {
     });
 
     await withOperatorSessionSubscriber(async (ws) => {
-      const { messageEvent, changedEvent } = await emitTranscriptUpdateAndCollectEvents({
+      const { messageEvent } = await emitTranscriptUpdateAndCollectMessageEvent({
         ws,
         sessionKey: "agent:main:main",
         sessionId: "sess-main",
@@ -649,18 +699,6 @@ describe("session.message websocket events", () => {
       });
       expectRecordFields(messageEvent.payload, {
         sessionKey: "agent:main:main",
-        messageId: "msg-usage",
-        messageSeq: 1,
-        totalTokens: 2_400,
-        totalTokensFresh: true,
-        contextTokens: 123_456,
-        estimatedCostUsd: 0.0042,
-        modelProvider: "openai",
-        model: "gpt-5.4",
-      });
-      expectRecordFields(changedEvent.payload, {
-        sessionKey: "agent:main:main",
-        phase: "message",
         messageId: "msg-usage",
         messageSeq: 1,
         totalTokens: 2_400,
@@ -685,7 +723,7 @@ describe("session.message websocket events", () => {
     });
 
     await withOperatorSessionSubscriber(async (ws) => {
-      const { messageEvent, changedEvent } = await emitTranscriptUpdateAndCollectEvents({
+      const { messageEvent } = await emitTranscriptUpdateAndCollectMessageEvent({
         ws,
         sessionKey: "agent:main:main",
         sessionId: "sess-main",
@@ -697,15 +735,8 @@ describe("session.message websocket events", () => {
         messageId: "msg-carried-seq",
         messageSeq: 7,
       });
-
       expectRecordFields(messageEvent.payload, {
         sessionKey: "agent:main:main",
-        messageId: "msg-carried-seq",
-        messageSeq: 7,
-      });
-      expectRecordFields(changedEvent.payload, {
-        sessionKey: "agent:main:main",
-        phase: "message",
         messageId: "msg-carried-seq",
         messageSeq: 7,
       });
@@ -715,7 +746,59 @@ describe("session.message websocket events", () => {
     });
   });
 
-  test("includes spawnedBy metadata on session.message and sessions.changed transcript events", async () => {
+  test("derives message sequence for selected-session transcript subscribers", async () => {
+    await setupTranscriptFixtureState();
+    await seedGatewaySessionEntries({
+      entries: {
+        main: {
+          sessionId: "sess-main",
+          updatedAt: Date.now(),
+        },
+      },
+    });
+    const transcriptMessage = {
+      role: "user",
+      content: [{ type: "text", text: "early selected prompt" }],
+      timestamp: Date.now(),
+    };
+    await replaceTranscriptEvents({
+      sessionId: "sess-main",
+      events: [
+        { type: "session", version: 1, id: "sess-main" },
+        { id: "msg-selected", message: transcriptMessage },
+      ],
+    });
+
+    const ws = await harness.openWs();
+    try {
+      await connectOk(ws, { scopes: ["operator.read"] });
+      const subscribeRes = await rpcReq(ws, "sessions.messages.subscribe", {
+        key: "main",
+      });
+      expect(subscribeRes.ok).toBe(true);
+      expect(subscribeRes.payload?.key).toBe("agent:main:main");
+
+      const messageEventPromise = waitForSessionMessageEvent(ws, "agent:main:main");
+      await emitTranscriptUpdate({
+        agentId: "main",
+        sessionId: "sess-main",
+        sessionKey: "agent:main:main",
+        message: transcriptMessage,
+        messageId: "msg-selected",
+      });
+
+      const messageEvent = await messageEventPromise;
+      expectRecordFields(messageEvent.payload, {
+        sessionKey: "agent:main:main",
+        messageId: "msg-selected",
+        messageSeq: 1,
+      });
+    } finally {
+      ws.close();
+    }
+  });
+
+  test("includes spawnedBy metadata on session.message transcript events", async () => {
     await setupTranscriptFixtureState();
     await seedGatewaySessionEntries({
       entries: {
@@ -758,16 +841,6 @@ describe("session.message websocket events", () => {
           (message.payload as { sessionKey?: string } | undefined)?.sessionKey ===
             "agent:main:child",
       );
-      const changedEventPromise = onceMessage(
-        ws,
-        (message) =>
-          message.type === "event" &&
-          message.event === "sessions.changed" &&
-          (message.payload as { phase?: string; sessionKey?: string } | undefined)?.phase ===
-            "message" &&
-          (message.payload as { sessionKey?: string } | undefined)?.sessionKey ===
-            "agent:main:child",
-      );
 
       await emitTranscriptUpdate({
         agentId: "main",
@@ -777,23 +850,9 @@ describe("session.message websocket events", () => {
         messageId: "msg-spawn",
       });
 
-      const [messageEvent, changedEvent] = await Promise.all([
-        messageEventPromise,
-        changedEventPromise,
-      ]);
+      const messageEvent = await messageEventPromise;
       expectRecordFields(messageEvent.payload, {
         sessionKey: "agent:main:child",
-        spawnedBy: "agent:main:main",
-        spawnedWorkspaceDir: "/tmp/subagent-workspace",
-        forkedFromParent: true,
-        spawnDepth: 2,
-        subagentRole: "orchestrator",
-        subagentControlScope: "children",
-        parentSessionKey: "agent:main:main",
-      });
-      expectRecordFields(changedEvent.payload, {
-        sessionKey: "agent:main:child",
-        phase: "message",
         spawnedBy: "agent:main:main",
         spawnedWorkspaceDir: "/tmp/subagent-workspace",
         forkedFromParent: true,
@@ -807,7 +866,7 @@ describe("session.message websocket events", () => {
     }
   });
 
-  test("includes route thread metadata on session.message and sessions.changed transcript events", async () => {
+  test("includes route thread metadata on session.message transcript events", async () => {
     await setupTranscriptFixtureState();
     await seedGatewaySessionEntries({
       entries: {
@@ -838,7 +897,7 @@ describe("session.message websocket events", () => {
     });
 
     await withOperatorSessionSubscriber(async (ws) => {
-      const { messageEvent, changedEvent } = await emitTranscriptUpdateAndCollectEvents({
+      const { messageEvent } = await emitTranscriptUpdateAndCollectMessageEvent({
         ws,
         sessionKey: "agent:main:main",
         sessionId: "sess-thread",
@@ -847,17 +906,6 @@ describe("session.message websocket events", () => {
       });
       expectRecordFields(messageEvent.payload, {
         sessionKey: "agent:main:main",
-        deliveryContext: {
-          channel: "telegram",
-          to: "-100123",
-          accountId: "acct-1",
-          chatType: "direct",
-          threadId: "42",
-        },
-      });
-      expectRecordFields(changedEvent.payload, {
-        sessionKey: "agent:main:main",
-        phase: "message",
         deliveryContext: {
           channel: "telegram",
           to: "-100123",

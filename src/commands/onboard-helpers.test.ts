@@ -71,6 +71,10 @@ function requireFirstRunCommandCall(): RunCommandCall {
   return call as RunCommandCall;
 }
 
+function expectedTrashSourcePath(targetPath: string): string {
+  return path.join(fs.realpathSync(path.dirname(targetPath)), path.basename(targetPath));
+}
+
 describe("handleReset", () => {
   it("uses active profile paths for destructive reset targets", async () => {
     const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-reset-profile-"));
@@ -104,6 +108,15 @@ describe("handleReset", () => {
     vi.stubEnv("OPENCLAW_CONFIG_PATH", profileConfigPath);
 
     const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
+    const expectedTrashedPaths = [
+      profileConfigPath,
+      profileCredentialsDir,
+      profileAgentDb,
+      `${profileAgentDb}-wal`,
+      `${profileAgentDb}-shm`,
+      workspaceDir,
+    ].map(expectedTrashSourcePath);
+    const expectedDefaultCredentialsDir = expectedTrashSourcePath(defaultCredentialsDir);
 
     try {
       await handleReset("full", workspaceDir, runtime);
@@ -112,15 +125,8 @@ describe("handleReset", () => {
     }
 
     const trashedPaths = mocks.movePathToTrash.mock.calls.map(([targetPath]) => targetPath);
-    expect(trashedPaths).toEqual([
-      profileConfigPath,
-      profileCredentialsDir,
-      profileAgentDb,
-      `${profileAgentDb}-wal`,
-      `${profileAgentDb}-shm`,
-      workspaceDir,
-    ]);
-    expect(trashedPaths).not.toContain(defaultCredentialsDir);
+    expect(trashedPaths).toEqual(expectedTrashedPaths);
+    expect(trashedPaths).not.toContain(expectedDefaultCredentialsDir);
   });
 });
 
@@ -130,6 +136,7 @@ describe("moveToTrash", () => {
     const targetPath = path.join(testRoot, "target");
     fs.mkdirSync(targetPath, { recursive: true });
     const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
+    const sourcePath = expectedTrashSourcePath(targetPath);
 
     try {
       await moveToTrash(targetPath, runtime);
@@ -137,8 +144,8 @@ describe("moveToTrash", () => {
       fs.rmSync(testRoot, { recursive: true, force: true });
     }
 
-    expect(mocks.movePathToTrash).toHaveBeenCalledWith(targetPath, {
-      allowedRoots: [path.dirname(targetPath)],
+    expect(mocks.movePathToTrash).toHaveBeenCalledWith(sourcePath, {
+      allowedRoots: [path.dirname(sourcePath)],
     });
     expect(mocks.runCommandWithTimeout).not.toHaveBeenCalled();
     expect(runtime.log).toHaveBeenCalledWith(`Moved to Trash: ${targetPath}`);

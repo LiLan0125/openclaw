@@ -105,6 +105,7 @@ export type TelegramMessageContext = {
   skillFilter: TelegramMessageContextPayload["skillFilter"];
   sendTyping: () => Promise<void>;
   sendRecordVoice: () => Promise<void>;
+  sendChatActionHandler: BuildTelegramMessageContextParams["sendChatActionHandler"];
   ackReactionPromise: Promise<boolean> | null;
   reactionApi: TelegramReactionApi | null;
   removeAckAfterReply: boolean;
@@ -194,14 +195,14 @@ export const buildTelegramMessageContext = async ({
             : undefined;
 
     if (topicPatch) {
-      updateTopicName(chatId, resolvedThreadId, topicPatch, topicNameCacheScope);
+      await updateTopicName(chatId, resolvedThreadId, topicPatch, topicNameCacheScope);
     }
 
-    topicName = getTopicName(chatId, resolvedThreadId, topicNameCacheScope);
+    topicName = await getTopicName(chatId, resolvedThreadId, topicNameCacheScope);
     if (!topicName) {
       const replyFtCreated = msg.reply_to_message?.forum_topic_created;
       if (replyFtCreated?.name) {
-        updateTopicName(
+        await updateTopicName(
           chatId,
           resolvedThreadId,
           {
@@ -275,7 +276,6 @@ export const buildTelegramMessageContext = async ({
     accountId: account.accountId,
     senderId,
   });
-  // Group sender checks are explicit and must not inherit DM pairing-store entries.
   const effectiveGroupAllow = normalizeAllowFrom(expandedGroupAllowFrom);
   const hasGroupAllowOverride = groupAllowOverride !== undefined;
   const senderUsername = msg.from?.username ?? "";
@@ -517,35 +517,35 @@ export const buildTelegramMessageContext = async ({
   const ackReactionEmoji =
     ackReaction && isTelegramSupportedReactionEmoji(ackReaction) ? ackReaction : undefined;
   const removeAckAfterReply = cfg.messages?.removeAckAfterReply ?? false;
-  const shouldAckReaction = () =>
-    Boolean(
-      canShowStatusReaction &&
-      ackReaction &&
-      shouldAckReactionGate({
-        scope: ackReactionScope,
-        isDirect: !isGroup,
-        isGroup,
-        isMentionableGroup: isGroup,
-        requireMention: Boolean(requireMention),
-        canDetectMention: bodyResult.canDetectMention,
-        effectiveWasMentioned: bodyResult.effectiveWasMentioned,
-        shouldBypassMention: bodyResult.shouldBypassMention,
-      }),
-    );
-  // Status Reactions controller (lifecycle reactions)
+  const shouldSendAckReaction = Boolean(
+    canShowStatusReaction &&
+    ackReaction &&
+    shouldAckReactionGate({
+      scope: ackReactionScope,
+      isDirect: !isGroup,
+      isGroup,
+      isMentionableGroup: isGroup,
+      requireMention: Boolean(requireMention),
+      canDetectMention: bodyResult.canDetectMention,
+      effectiveWasMentioned: bodyResult.effectiveWasMentioned,
+      shouldBypassMention: bodyResult.shouldBypassMention,
+    }),
+  );
   const statusReactionsConfig = cfg.messages?.statusReactions;
   const statusReactionsEnabled =
-    statusReactionsConfig?.enabled === true && Boolean(reactionApi) && shouldAckReaction();
-  const resolvedStatusReactionEmojis = resolveTelegramStatusReactionEmojis({
-    initialEmoji: ackReaction,
-    overrides: statusReactionsConfig?.emojis,
-  });
-  const statusReactionVariantsByEmoji = buildTelegramStatusReactionVariants(
-    resolvedStatusReactionEmojis,
-  );
+    statusReactionsConfig?.enabled === true && Boolean(reactionApi) && shouldSendAckReaction;
+  const resolvedStatusReactionEmojis = statusReactionsEnabled
+    ? resolveTelegramStatusReactionEmojis({
+        initialEmoji: ackReaction,
+        overrides: statusReactionsConfig?.emojis,
+      })
+    : null;
+  const statusReactionVariantsByEmoji = resolvedStatusReactionEmojis
+    ? buildTelegramStatusReactionVariants(resolvedStatusReactionEmojis)
+    : new Map<string, string[]>();
   let allowedStatusReactionEmojisPromise: Promise<Set<TelegramReactionEmoji> | null> | null = null;
   const createStatusReactionController =
-    statusReactionsEnabled && msg.message_id
+    statusReactionsEnabled && resolvedStatusReactionEmojis && msg.message_id
       ? (runtime?.createStatusReactionController ??
         (await loadTelegramMessageContextRuntime()).createStatusReactionController)
       : null;
@@ -584,7 +584,7 @@ export const buildTelegramMessageContext = async ({
             },
           },
           initialEmoji: ackReaction,
-          emojis: resolvedStatusReactionEmojis,
+          emojis: resolvedStatusReactionEmojis ?? undefined,
           timing: statusReactionsConfig?.timing,
           onError: (err) => {
             logVerbose(`telegram status-reaction error for chat ${chatId}: ${String(err)}`);
@@ -593,13 +593,13 @@ export const buildTelegramMessageContext = async ({
       : null;
 
   const ackReactionPromise: Promise<boolean> | null = statusReactionController
-    ? shouldAckReaction()
+    ? shouldSendAckReaction
       ? Promise.resolve(statusReactionController.setQueued()).then(
           () => true,
           () => false,
         )
       : null
-    : shouldAckReaction() && msg.message_id && reactionApi && ackReactionEmoji
+    : shouldSendAckReaction && msg.message_id && reactionApi && ackReactionEmoji
       ? withTelegramApiErrorLogging({
           operation: "setMessageReaction",
           fn: () =>
@@ -633,6 +633,7 @@ export const buildTelegramMessageContext = async ({
     skillFilter,
     sendTyping,
     sendRecordVoice,
+    sendChatActionHandler,
     ackReactionPromise,
     reactionApi,
     removeAckAfterReply,

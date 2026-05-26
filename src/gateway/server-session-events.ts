@@ -161,6 +161,7 @@ async function handleTranscriptUpdateBroadcast(
       connIds,
       { dropIfSlow: true },
     );
+    return;
   }
 
   const sessionEventConnIds = params.sessionEventSubscribers.getAll();

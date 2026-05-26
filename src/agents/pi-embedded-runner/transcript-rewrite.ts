@@ -84,7 +84,11 @@ function appendTranscriptStateBranchEntry(params: {
 export function rewriteTranscriptEntriesInState(params: {
   state: TranscriptState;
   replacements: TranscriptRewriteReplacement[];
-}): TranscriptRewriteResult & { appendedEntries: SessionBranchEntry[] } {
+  allowedRewriteSuffixEntryIds?: string[];
+}): TranscriptRewriteResult & {
+  appendedEntries: SessionBranchEntry[];
+  supersededEntryIds: string[];
+} {
   const replacementsById = new Map(
     params.replacements
       .filter((replacement) => replacement.entryId.trim().length > 0)
@@ -97,6 +101,7 @@ export function rewriteTranscriptEntriesInState(params: {
       rewrittenEntries: 0,
       reason: "no replacements requested",
       appendedEntries: [],
+      supersededEntryIds: [],
     };
   }
 
@@ -108,6 +113,7 @@ export function rewriteTranscriptEntriesInState(params: {
       rewrittenEntries: 0,
       reason: "empty session",
       appendedEntries: [],
+      supersededEntryIds: [],
     };
   }
 
@@ -136,6 +142,7 @@ export function rewriteTranscriptEntriesInState(params: {
       rewrittenEntries: 0,
       reason: "no matching message entries",
       appendedEntries: [],
+      supersededEntryIds: [],
     };
   }
 
@@ -149,7 +156,25 @@ export function rewriteTranscriptEntriesInState(params: {
       rewrittenEntries: 0,
       reason: "invalid first rewrite target",
       appendedEntries: [],
+      supersededEntryIds: [],
     };
+  }
+
+  if (params.allowedRewriteSuffixEntryIds) {
+    const allowedIds = new Set(params.allowedRewriteSuffixEntryIds);
+    const hasUnexpectedSuffixEntry = branch
+      .slice(matchedIndices[0])
+      .some((entry) => typeof entry.id === "string" && !allowedIds.has(entry.id));
+    if (hasUnexpectedSuffixEntry) {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "rewrite suffix guard failed",
+        appendedEntries: [],
+        supersededEntryIds: [],
+      };
+    }
   }
 
   if (!firstMatchedEntry.parentId) {
@@ -180,6 +205,7 @@ export function rewriteTranscriptEntriesInState(params: {
     bytesFreed,
     rewrittenEntries: matchedIndices.length,
     appendedEntries,
+    supersededEntryIds: branch.slice(matchedIndices[0]).map((entry) => entry.id),
   };
 }
 
@@ -204,6 +230,9 @@ export async function rewriteTranscriptEntriesInSqliteTranscript(params: {
     const result = rewriteTranscriptEntriesInState({
       state,
       replacements: params.request.replacements,
+      ...(params.request.allowedRewriteSuffixEntryIds
+        ? { allowedRewriteSuffixEntryIds: params.request.allowedRewriteSuffixEntryIds }
+        : {}),
     });
     if (result.changed) {
       await persistTranscriptStateMutationForSession({
@@ -212,6 +241,7 @@ export async function rewriteTranscriptEntriesInSqliteTranscript(params: {
         sessionId: params.sessionId,
         state,
         appendedEntries: result.appendedEntries,
+        supersededMessageIdempotencyEventIds: result.supersededEntryIds,
       });
       emitSessionTranscriptUpdate({
         agentId: params.agentId,

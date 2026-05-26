@@ -2383,6 +2383,7 @@ export type MigrationItemStatus =
   | "conflict"
   | "error";
 export type MigrationItemKind =
+  | "auth"
   | "config"
   | "secret"
   | "memory"

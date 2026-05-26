@@ -389,11 +389,15 @@ describe("agents delete command", () => {
         },
       });
 
+      const expectedOpsWorkspace = path.join(
+        await fs.realpath(path.dirname(opsWorkspace)),
+        path.basename(opsWorkspace),
+      );
+
       await agentsDeleteCommand({ id: "ops", force: true, json: true }, runtime);
 
-      const resolvedOpsWorkspace = await fs.realpath(opsWorkspace);
-      expect(fsSafeMocks.movePathToTrash).toHaveBeenCalledWith(resolvedOpsWorkspace, {
-        allowedRoots: [path.dirname(resolvedOpsWorkspace)],
+      expect(fsSafeMocks.movePathToTrash).toHaveBeenCalledWith(expectedOpsWorkspace, {
+        allowedRoots: [path.dirname(expectedOpsWorkspace)],
       });
       expect(processMocks.runCommandWithTimeout).not.toHaveBeenCalled();
     });

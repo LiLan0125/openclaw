@@ -15,13 +15,17 @@ import {
 import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
 import type { SubagentRunOutcome } from "./subagent-announce-output.js";
+import {
+  type LegacySubagentRunRecord as DeliveryLegacySubagentRunRecord,
+  normalizeSubagentRunState,
+} from "./subagent-delivery-state.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 type SubagentRunsTable = OpenClawStateKyselyDatabase["subagent_runs"];
 type SubagentRunRow = Selectable<SubagentRunsTable>;
 type SubagentRegistryDatabase = Pick<OpenClawStateKyselyDatabase, "subagent_runs">;
 
-type PersistedSubagentRunRecord = SubagentRunRecord;
+type PersistedSubagentRunRecord = DeliveryLegacySubagentRunRecord;
 
 type LegacySubagentRunRecord = PersistedSubagentRunRecord & {
   announceCompletedAt?: unknown;
@@ -97,16 +101,19 @@ function normalizePersistedRunRecords(params: {
       requesterAccountId: _accountId,
       ...rest
     } = typed;
-    out.set(runId, {
-      ...rest,
-      childSessionKey,
-      requesterSessionKey,
-      controllerSessionKey,
-      requesterOrigin,
-      cleanupCompletedAt,
-      cleanupHandled,
-      spawnMode: typed.spawnMode === "session" ? "session" : "run",
-    });
+    out.set(
+      runId,
+      normalizeSubagentRunState({
+        ...rest,
+        childSessionKey,
+        requesterSessionKey,
+        controllerSessionKey,
+        requesterOrigin,
+        cleanupCompletedAt,
+        cleanupHandled,
+        spawnMode: typed.spawnMode === "session" ? "session" : "run",
+      }),
+    );
   }
   return out;
 }
@@ -145,8 +152,14 @@ function normalizeNumber(value: number | bigint | null): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
+function cloneSubagentRunRecord(record: SubagentRunRecord): SubagentRunRecord {
+  return JSON.parse(JSON.stringify(record)) as SubagentRunRecord;
+}
+
 function rowToRunRecord(row: SubagentRunRow): SubagentRunRecord | null {
-  const raw: PersistedSubagentRunRecord = {
+  const payload = parseJsonValue<Partial<LegacySubagentRunRecord>>(row.payload_json) ?? {};
+  const raw: LegacySubagentRunRecord = {
+    ...payload,
     runId: row.run_id,
     childSessionKey: row.child_session_key,
     controllerSessionKey: row.controller_session_key ?? undefined,
@@ -204,52 +217,60 @@ function rowToRunRecord(row: SubagentRunRow): SubagentRunRecord | null {
 }
 
 function runRecordToRow(record: SubagentRunRecord): Insertable<SubagentRunsTable> {
+  const normalized = normalizeSubagentRunState(cloneSubagentRunRecord(record));
+  const execution = normalized.execution;
+  const completion = normalized.completion;
+  const delivery = normalized.delivery;
+  const legacyPendingDelivery =
+    delivery?.status === "pending" ||
+    delivery?.status === "in_progress" ||
+    delivery?.status === "suspended";
   return {
-    run_id: record.runId,
-    child_session_key: record.childSessionKey,
-    controller_session_key: record.controllerSessionKey ?? null,
-    requester_session_key: record.requesterSessionKey,
-    requester_display_key: record.requesterDisplayKey,
-    requester_origin_json: serializeJson(record.requesterOrigin),
-    task: record.task,
-    task_name: record.taskName ?? null,
-    cleanup: record.cleanup,
-    label: record.label ?? null,
-    model: record.model ?? null,
-    agent_dir: record.agentDir ?? null,
-    workspace_dir: record.workspaceDir ?? null,
-    run_timeout_seconds: record.runTimeoutSeconds ?? null,
-    spawn_mode: record.spawnMode ?? "run",
-    created_at: record.createdAt,
-    started_at: record.startedAt ?? null,
-    session_started_at: record.sessionStartedAt ?? null,
-    accumulated_runtime_ms: record.accumulatedRuntimeMs ?? null,
-    ended_at: record.endedAt ?? null,
-    outcome_json: serializeJson(record.outcome),
-    archive_at_ms: record.archiveAtMs ?? null,
-    cleanup_completed_at: record.cleanupCompletedAt ?? null,
-    cleanup_handled: sqliteBooleanInteger(record.cleanupHandled),
-    suppress_announce_reason: record.suppressAnnounceReason ?? null,
-    expects_completion_message: sqliteBooleanInteger(record.expectsCompletionMessage),
-    announce_retry_count: record.announceRetryCount ?? null,
-    last_announce_retry_at: record.lastAnnounceRetryAt ?? null,
-    last_announce_delivery_error: record.lastAnnounceDeliveryError ?? null,
-    ended_reason: record.endedReason ?? null,
-    pause_reason: record.pauseReason ?? null,
-    wake_on_descendant_settle: sqliteBooleanInteger(record.wakeOnDescendantSettle),
-    frozen_result_text: record.frozenResultText ?? null,
-    frozen_result_captured_at: record.frozenResultCapturedAt ?? null,
-    fallback_frozen_result_text: record.fallbackFrozenResultText ?? null,
-    fallback_frozen_result_captured_at: record.fallbackFrozenResultCapturedAt ?? null,
-    ended_hook_emitted_at: record.endedHookEmittedAt ?? null,
-    pending_final_delivery: sqliteBooleanInteger(record.pendingFinalDelivery),
-    pending_final_delivery_created_at: record.pendingFinalDeliveryCreatedAt ?? null,
-    pending_final_delivery_last_attempt_at: record.pendingFinalDeliveryLastAttemptAt ?? null,
-    pending_final_delivery_attempt_count: record.pendingFinalDeliveryAttemptCount ?? null,
-    pending_final_delivery_last_error: record.pendingFinalDeliveryLastError ?? null,
-    pending_final_delivery_payload_json: serializeJson(record.pendingFinalDeliveryPayload),
-    completion_announced_at: record.completionAnnouncedAt ?? null,
-    payload_json: JSON.stringify(record),
+    run_id: normalized.runId,
+    child_session_key: normalized.childSessionKey,
+    controller_session_key: normalized.controllerSessionKey ?? null,
+    requester_session_key: normalized.requesterSessionKey,
+    requester_display_key: normalized.requesterDisplayKey,
+    requester_origin_json: serializeJson(normalized.requesterOrigin),
+    task: normalized.task,
+    task_name: normalized.taskName ?? null,
+    cleanup: normalized.cleanup,
+    label: normalized.label ?? null,
+    model: normalized.model ?? null,
+    agent_dir: normalized.agentDir ?? null,
+    workspace_dir: normalized.workspaceDir ?? null,
+    run_timeout_seconds: normalized.runTimeoutSeconds ?? null,
+    spawn_mode: normalized.spawnMode ?? "run",
+    created_at: normalized.createdAt,
+    started_at: execution?.startedAt ?? normalized.startedAt ?? null,
+    session_started_at: normalized.sessionStartedAt ?? null,
+    accumulated_runtime_ms: normalized.accumulatedRuntimeMs ?? null,
+    ended_at: execution?.endedAt ?? normalized.endedAt ?? null,
+    outcome_json: serializeJson(execution?.outcome ?? normalized.outcome),
+    archive_at_ms: normalized.archiveAtMs ?? null,
+    cleanup_completed_at: normalized.cleanupCompletedAt ?? null,
+    cleanup_handled: sqliteBooleanInteger(normalized.cleanupHandled),
+    suppress_announce_reason: normalized.suppressAnnounceReason ?? null,
+    expects_completion_message: sqliteBooleanInteger(normalized.expectsCompletionMessage),
+    announce_retry_count: delivery?.attemptCount ?? null,
+    last_announce_retry_at: delivery?.lastAttemptAt ?? null,
+    last_announce_delivery_error: delivery?.lastError ?? null,
+    ended_reason: normalized.endedReason ?? null,
+    pause_reason: normalized.pauseReason ?? null,
+    wake_on_descendant_settle: sqliteBooleanInteger(normalized.wakeOnDescendantSettle),
+    frozen_result_text: completion?.resultText ?? null,
+    frozen_result_captured_at: completion?.capturedAt ?? null,
+    fallback_frozen_result_text: completion?.fallbackResultText ?? null,
+    fallback_frozen_result_captured_at: completion?.fallbackCapturedAt ?? null,
+    ended_hook_emitted_at: normalized.endedHookEmittedAt ?? null,
+    pending_final_delivery: sqliteBooleanInteger(legacyPendingDelivery),
+    pending_final_delivery_created_at: delivery?.createdAt ?? null,
+    pending_final_delivery_last_attempt_at: delivery?.lastAttemptAt ?? null,
+    pending_final_delivery_attempt_count: delivery?.attemptCount ?? null,
+    pending_final_delivery_last_error: delivery?.lastError ?? null,
+    pending_final_delivery_payload_json: serializeJson(delivery?.payload),
+    completion_announced_at: delivery?.announcedAt ?? null,
+    payload_json: JSON.stringify(normalized),
   };
 }
 

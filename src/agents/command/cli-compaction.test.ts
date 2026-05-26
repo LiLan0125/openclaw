@@ -166,6 +166,162 @@ describe("runCliTurnCompactionLifecycle", () => {
     expect(updatedEntry?.cliSessionBindings?.["claude-cli"]).toBeUndefined();
   });
 
+  it("skips OpenClaw automatic CLI compaction for Codex runtime sessions", async () => {
+    const sessionKey = "agent:main:codex";
+    const sessionId = "session-codex";
+    const sessionEntry: SessionEntry = {
+      sessionId,
+      updatedAt: Date.now(),
+      contextTokens: 1_000,
+      totalTokens: 950,
+      totalTokensFresh: true,
+      agentHarnessId: "codex",
+    };
+    const sessionStore: Record<string, SessionEntry> = { [sessionKey]: sessionEntry };
+
+    const resolveContextEngine = vi.fn(async () => buildContextEngine({ compactCalls: [] }));
+    const ensureSelectedAgentHarnessPlugin = vi.fn(async () => undefined);
+    const compactAgentHarnessSession = vi.fn(async () => ({
+      ok: true,
+      compacted: true,
+      result: { tokensBefore: 950, tokensAfter: 100 },
+    }));
+    const applyPiAutoCompactionGuard = vi.fn(async () => undefined);
+    setCliCompactionTestDeps({
+      resolveContextEngine,
+      ensureSelectedAgentHarnessPlugin,
+      maybeCompactAgentHarnessSession: compactAgentHarnessSession as never,
+      applyPiAutoCompactionGuard,
+    });
+
+    const updatedEntry = await runCliTurnCompactionLifecycle({
+      cfg: {} as OpenClawConfig,
+      sessionId,
+      sessionKey,
+      sessionEntry,
+      sessionStore,
+      sessionAgentId: "main",
+      workspaceDir: tmpDir,
+      agentDir: tmpDir,
+      provider: "openai",
+      model: "gpt-5.5",
+    });
+
+    expect(resolveContextEngine).not.toHaveBeenCalled();
+    expect(applyPiAutoCompactionGuard).not.toHaveBeenCalled();
+    expect(ensureSelectedAgentHarnessPlugin).not.toHaveBeenCalled();
+    expect(compactAgentHarnessSession).not.toHaveBeenCalled();
+    expect(updatedEntry).toBe(sessionEntry);
+  });
+
+  it("routes matching native harness CLI compaction through the harness", async () => {
+    const sessionKey = "agent:main:external-harness";
+    const sessionId = "session-external-harness";
+    seedSqliteTranscript({ sessionId, cwd: tmpDir });
+
+    const sessionEntry: SessionEntry = {
+      sessionId,
+      updatedAt: Date.now(),
+      contextTokens: 1_000,
+      totalTokens: 950,
+      totalTokensFresh: true,
+      agentHarnessId: "external-harness",
+    };
+    const sessionStore: Record<string, SessionEntry> = { [sessionKey]: sessionEntry };
+    upsertSessionEntry({ agentId: "main", sessionKey, entry: sessionEntry });
+
+    const compactCalls: Array<Parameters<ContextEngine["compact"]>[0]> = [];
+    const contextEngine = buildContextEngine({ compactCalls });
+    const resolveContextEngine = vi.fn(async () => contextEngine);
+    const ensureSelectedAgentHarnessPlugin = vi.fn(async () => undefined);
+    const compactAgentHarnessSession = vi.fn(async () => ({
+      ok: true,
+      compacted: true,
+      result: {
+        summary: "native compacted",
+        firstKeptEntryId: "kept-1",
+        tokensBefore: 950,
+        tokensAfter: 100,
+        sessionId: "session-external-harness-next",
+      },
+    }));
+    const applyPiAutoCompactionGuard = vi.fn(async () => undefined);
+    setCliCompactionTestDeps({
+      resolveContextEngine,
+      ensureSelectedAgentHarnessPlugin,
+      maybeCompactAgentHarnessSession: compactAgentHarnessSession as never,
+      createPreparedEmbeddedPiSettingsManager: async () => ({
+        getCompactionReserveTokens: () => 200,
+        getCompactionKeepRecentTokens: () => 0,
+        applyOverrides: () => {},
+      }),
+      shouldPreemptivelyCompactBeforePrompt: () => ({
+        route: "fits",
+        shouldCompact: false,
+        estimatedPromptTokens: 600,
+        promptBudgetBeforeReserve: 800,
+        overflowTokens: 0,
+        toolResultReducibleChars: 0,
+        effectiveReserveTokens: 200,
+      }),
+      resolveLiveToolResultMaxChars: () => 20_000,
+      applyPiAutoCompactionGuard,
+    });
+
+    const updatedEntry = await runCliTurnCompactionLifecycle({
+      cfg: {} as OpenClawConfig,
+      sessionId,
+      sessionKey,
+      sessionEntry,
+      sessionStore,
+      sessionAgentId: "main",
+      workspaceDir: tmpDir,
+      agentDir: tmpDir,
+      provider: "external-harness",
+      model: "model",
+    });
+
+    expect(resolveContextEngine).toHaveBeenCalledTimes(1);
+    expect(applyPiAutoCompactionGuard).toHaveBeenCalledWith(
+      expect.objectContaining({ contextEngineInfo: contextEngine.info }),
+    );
+    expect(ensureSelectedAgentHarnessPlugin).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "external-harness",
+        modelId: "model",
+        sessionKey,
+        agentHarnessRuntimeOverride: "external-harness",
+      }),
+    );
+    expect(compactAgentHarnessSession).toHaveBeenCalledTimes(1);
+    expect(compactAgentHarnessSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        sessionKey,
+        provider: "external-harness",
+        model: "model",
+        contextTokenBudget: 1_000,
+        currentTokenCount: 950,
+        contextEngine,
+        agentHarnessId: "external-harness",
+        trigger: "budget",
+        force: true,
+      }),
+    );
+    expect(compactCalls).toHaveLength(0);
+    expect(updatedEntry).toMatchObject({
+      sessionId: "session-external-harness-next",
+      compactionCount: 1,
+      totalTokens: 100,
+      totalTokensFresh: true,
+      usageFamilyKey: sessionKey,
+    });
+    expect(updatedEntry?.usageFamilySessionIds).toEqual([
+      sessionId,
+      "session-external-harness-next",
+    ]);
+  });
+
   it("initializes built-in context engines before resolving CLI compaction engine", async () => {
     const sessionKey = "agent:main:cli";
     const sessionId = "session-cli-init";
@@ -175,7 +331,7 @@ describe("runCliTurnCompactionLifecycle", () => {
       sessionId,
       updatedAt: Date.now(),
       contextTokens: 1_000,
-      totalTokens: 100,
+      totalTokens: 950,
       totalTokensFresh: true,
     };
     const calls: string[] = [];
@@ -195,7 +351,7 @@ describe("runCliTurnCompactionLifecycle", () => {
       shouldPreemptivelyCompactBeforePrompt: () => ({
         route: "fits",
         shouldCompact: false,
-        estimatedPromptTokens: 100,
+        estimatedPromptTokens: 600,
         promptBudgetBeforeReserve: 800,
         overflowTokens: 0,
         toolResultReducibleChars: 0,

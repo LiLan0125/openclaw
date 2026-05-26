@@ -15,6 +15,7 @@ import {
   DEFAULT_COMMITMENT_MAX_PER_HEARTBEAT,
   resolveCommitmentsConfig,
 } from "./config.js";
+import { runExclusiveCommitmentsStoreWrite } from "./store-writer.js";
 import type {
   CommitmentCandidate,
   CommitmentExtractionItem,
@@ -462,14 +463,26 @@ function expireStaleCommitmentsInStore(store: CommitmentStoreSnapshot, nowMs: nu
   return changed;
 }
 
+// Unchecked variant: callers already holding the commitments writer queue use
+// this to avoid re-entering the same lock while expiring stale rows.
+async function loadAndMarkExpiredUnchecked(
+  nowMs: number,
+): Promise<{ store: CommitmentStoreSnapshot; needsSave: boolean }> {
+  const { store, hadLegacySourceText } = loadCommitmentStoreInternal();
+  const expireChanged = expireStaleCommitmentsInStore(store, nowMs);
+  return { store, needsSave: expireChanged || hadLegacySourceText };
+}
+
 async function loadCommitmentStoreWithExpiredMarked(
   nowMs: number,
 ): Promise<CommitmentStoreSnapshot> {
-  const { store, hadLegacySourceText } = loadCommitmentStoreInternal();
-  if (expireStaleCommitmentsInStore(store, nowMs) || hadLegacySourceText) {
-    await saveCommitmentStore(store);
-  }
-  return store;
+  return await runExclusiveCommitmentsStoreWrite(resolveCommitmentDatabasePath(), async () => {
+    const { store, needsSave } = await loadAndMarkExpiredUnchecked(nowMs);
+    if (needsSave) {
+      await saveCommitmentStore(store);
+    }
+    return store;
+  });
 }
 
 export async function listPendingCommitmentsForScope(params: {
@@ -510,47 +523,48 @@ export async function upsertInferredCommitments(params: {
     return [];
   }
   const nowMs = params.nowMs ?? Date.now();
-  const store = await loadCommitmentStoreWithExpiredMarked(nowMs);
-  const created: CommitmentRecord[] = [];
   const scopeKey = buildCommitmentScopeKey(params.item);
-
-  for (const entry of params.candidates) {
-    const dedupeKey = entry.candidate.dedupeKey.trim();
-    const existingIndex = store.commitments.findIndex(
-      (commitment) =>
-        buildCommitmentScopeKey(commitment) === scopeKey &&
-        commitment.dedupeKey === dedupeKey &&
-        isActiveStatus(commitment.status),
-    );
-    if (existingIndex >= 0) {
-      const existing = store.commitments[existingIndex];
-      store.commitments[existingIndex] = {
-        ...existing,
-        reason: entry.candidate.reason.trim() || existing.reason,
-        suggestedText: entry.candidate.suggestedText.trim() || existing.suggestedText,
-        confidence: Math.max(existing.confidence, entry.candidate.confidence),
-        dueWindow: {
-          earliestMs: Math.min(existing.dueWindow.earliestMs, entry.earliestMs),
-          latestMs: Math.max(existing.dueWindow.latestMs, entry.latestMs),
-          timezone: entry.timezone,
-        },
-        updatedAtMs: nowMs,
-      };
-      continue;
+  return await runExclusiveCommitmentsStoreWrite(resolveCommitmentDatabasePath(), async () => {
+    const { store } = await loadAndMarkExpiredUnchecked(nowMs);
+    const created: CommitmentRecord[] = [];
+    for (const entry of params.candidates) {
+      const dedupeKey = entry.candidate.dedupeKey.trim();
+      const existingIndex = store.commitments.findIndex(
+        (commitment) =>
+          buildCommitmentScopeKey(commitment) === scopeKey &&
+          commitment.dedupeKey === dedupeKey &&
+          isActiveStatus(commitment.status),
+      );
+      if (existingIndex >= 0) {
+        const existing = store.commitments[existingIndex];
+        store.commitments[existingIndex] = {
+          ...existing,
+          reason: entry.candidate.reason.trim() || existing.reason,
+          suggestedText: entry.candidate.suggestedText.trim() || existing.suggestedText,
+          confidence: Math.max(existing.confidence, entry.candidate.confidence),
+          dueWindow: {
+            earliestMs: Math.min(existing.dueWindow.earliestMs, entry.earliestMs),
+            latestMs: Math.max(existing.dueWindow.latestMs, entry.latestMs),
+            timezone: entry.timezone,
+          },
+          updatedAtMs: nowMs,
+        };
+        continue;
+      }
+      const record = candidateToRecord({
+        item: params.item,
+        candidate: entry.candidate,
+        nowMs,
+        earliestMs: entry.earliestMs,
+        latestMs: entry.latestMs,
+        timezone: entry.timezone,
+      });
+      store.commitments.push(record);
+      created.push(record);
     }
-    const record = candidateToRecord({
-      item: params.item,
-      candidate: entry.candidate,
-      nowMs,
-      earliestMs: entry.earliestMs,
-      latestMs: entry.latestMs,
-      timezone: entry.timezone,
-    });
-    store.commitments.push(record);
-    created.push(record);
-  }
-  await saveCommitmentStore(store);
-  return created;
+    await saveCommitmentStore(store);
+    return created;
+  });
 }
 
 function countSentCommitmentsForSession(params: {
@@ -662,23 +676,25 @@ export async function markCommitmentsAttempted(params: {
   }
   const idSet = new Set(params.ids);
   const nowMs = params.nowMs ?? Date.now();
-  const store = await loadCommitmentStore();
-  let changed = false;
-  store.commitments = store.commitments.map((commitment) => {
-    if (!idSet.has(commitment.id)) {
-      return commitment;
+  await runExclusiveCommitmentsStoreWrite(resolveCommitmentDatabasePath(), async () => {
+    const store = await loadCommitmentStore();
+    let changed = false;
+    store.commitments = store.commitments.map((commitment) => {
+      if (!idSet.has(commitment.id)) {
+        return commitment;
+      }
+      changed = true;
+      return {
+        ...commitment,
+        attempts: commitment.attempts + 1,
+        lastAttemptAtMs: nowMs,
+        updatedAtMs: nowMs,
+      };
+    });
+    if (changed) {
+      await saveCommitmentStore(store);
     }
-    changed = true;
-    return {
-      ...commitment,
-      attempts: commitment.attempts + 1,
-      lastAttemptAtMs: nowMs,
-      updatedAtMs: nowMs,
-    };
   });
-  if (changed) {
-    await saveCommitmentStore(store);
-  }
 }
 
 export async function markCommitmentsStatus(params: {
@@ -692,25 +708,27 @@ export async function markCommitmentsStatus(params: {
   }
   const idSet = new Set(params.ids);
   const nowMs = params.nowMs ?? Date.now();
-  const store = await loadCommitmentStore();
-  let changed = false;
-  store.commitments = store.commitments.map((commitment) => {
-    if (!idSet.has(commitment.id) || !isActiveStatus(commitment.status)) {
-      return commitment;
+  await runExclusiveCommitmentsStoreWrite(resolveCommitmentDatabasePath(), async () => {
+    const store = await loadCommitmentStore();
+    let changed = false;
+    store.commitments = store.commitments.map((commitment) => {
+      if (!idSet.has(commitment.id) || !isActiveStatus(commitment.status)) {
+        return commitment;
+      }
+      changed = true;
+      return {
+        ...commitment,
+        status: params.status,
+        updatedAtMs: nowMs,
+        ...(params.status === "sent" ? { sentAtMs: nowMs } : {}),
+        ...(params.status === "dismissed" ? { dismissedAtMs: nowMs } : {}),
+        ...(params.status === "expired" ? { expiredAtMs: nowMs } : {}),
+      };
+    });
+    if (changed) {
+      await saveCommitmentStore(store);
     }
-    changed = true;
-    return {
-      ...commitment,
-      status: params.status,
-      updatedAtMs: nowMs,
-      ...(params.status === "sent" ? { sentAtMs: nowMs } : {}),
-      ...(params.status === "dismissed" ? { dismissedAtMs: nowMs } : {}),
-      ...(params.status === "expired" ? { expiredAtMs: nowMs } : {}),
-    };
   });
-  if (changed) {
-    await saveCommitmentStore(store);
-  }
 }
 
 export async function listCommitments(params?: {

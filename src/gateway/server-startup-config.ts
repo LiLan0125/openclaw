@@ -125,6 +125,7 @@ export async function loadGatewayStartupConfigSnapshot(params: {
           ...(pluginMetadataSnapshot?.manifestRegistry
             ? { manifestRegistry: pluginMetadataSnapshot.manifestRegistry }
             : {}),
+          discovery: pluginMetadataSnapshot?.discovery,
         }),
       );
   if (autoEnable.changes.length === 0) {
@@ -264,19 +265,29 @@ export function createRuntimeSecretsActivator(params: {
             config: pruneSkippedStartupSecretSurfaces(config),
           });
           if (fastPath) {
+            const coercePreflightSnapshot = (
+              value: unknown,
+              sourceConfig: OpenClawConfig,
+            ): PreparedRuntimeSecretsSnapshot | null => {
+              if (!value || typeof value !== "object") {
+                return null;
+              }
+              const candidate = value as PreparedRuntimeSecretsSnapshot;
+              return isDeepStrictEqual(candidate.sourceConfig, sourceConfig) ? candidate : null;
+            };
             return await finishPreparedSnapshot(fastPath.snapshot, activationParams, {
               activateRuntimeSecretsSnapshot: (snapshot) =>
                 activateSecretsRuntimeSnapshotState({
                   snapshot,
                   refreshContext: fastPath.refreshContext,
                   refreshHandler: {
-                    refresh: async ({ sourceConfig, includeAuthStoreRefs }) => {
+                    preflight: async ({ sourceConfig, includeAuthStoreRefs }) => {
                       const secretsRuntime = await loadSecretsRuntime();
                       const activeSnapshot = getActiveSecretsRuntimeSnapshot();
-                      const oneShotSkipAuthStoreRefs =
-                        includeAuthStoreRefs === false &&
-                        fastPath.refreshContext.includeAuthStoreRefs;
-                      const refreshed = await secretsRuntime.prepareSecretsRuntimeSnapshot({
+                      if (!activeSnapshot) {
+                        return false;
+                      }
+                      return await secretsRuntime.prepareSecretsRuntimeSnapshot({
                         config: sourceConfig,
                         env: fastPath.refreshContext.env,
                         agentDirs: resolveRefreshAgentDirs(sourceConfig, fastPath.refreshContext),
@@ -287,6 +298,27 @@ export function createRuntimeSecretsActivator(params: {
                           ? {}
                           : { loadAuthStore: fastPath.refreshContext.loadAuthStore }),
                       });
+                    },
+                    refresh: async ({ sourceConfig, includeAuthStoreRefs, preflightResult }) => {
+                      const secretsRuntime = await loadSecretsRuntime();
+                      const activeSnapshot = getActiveSecretsRuntimeSnapshot();
+                      const oneShotSkipAuthStoreRefs =
+                        includeAuthStoreRefs === false &&
+                        fastPath.refreshContext.includeAuthStoreRefs;
+                      const refreshed =
+                        coercePreflightSnapshot(preflightResult, sourceConfig) ??
+                        (await secretsRuntime.prepareSecretsRuntimeSnapshot({
+                          config: sourceConfig,
+                          env: fastPath.refreshContext.env,
+                          agentDirs: resolveRefreshAgentDirs(sourceConfig, fastPath.refreshContext),
+                          includeAuthStoreRefs:
+                            includeAuthStoreRefs ?? fastPath.refreshContext.includeAuthStoreRefs,
+                          loadablePluginOrigins: fastPath.refreshContext.loadablePluginOrigins,
+                          ...(fastPath.usesAuthStoreFallback ||
+                          !fastPath.refreshContext.loadAuthStore
+                            ? {}
+                            : { loadAuthStore: fastPath.refreshContext.loadAuthStore }),
+                        }));
                       if (oneShotSkipAuthStoreRefs && activeSnapshot) {
                         refreshed.authStores = getLiveSecretsRuntimeAuthStores();
                         setPreparedSecretsRuntimeSnapshotRefreshContext(

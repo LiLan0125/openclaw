@@ -34,6 +34,12 @@ export type AppendSqliteSessionTranscriptEventOptions = SqliteSessionTranscriptS
   parentMode?: "database-tail";
 };
 
+export type AppendSqliteSessionTranscriptEventsOptions = SqliteSessionTranscriptStoreOptions & {
+  events: unknown[];
+  now?: () => number;
+  supersededMessageIdempotencyEventIds?: string[];
+};
+
 export type AppendSqliteSessionTranscriptMessageOptions = SqliteSessionTranscriptStoreOptions & {
   cwd?: string;
   dedupeLatestAssistantText?: string;
@@ -90,7 +96,12 @@ type TranscriptEventIdentitiesTable = OpenClawAgentKyselyDatabase["transcript_ev
 type SessionsTable = OpenClawAgentKyselyDatabase["sessions"];
 type AgentTranscriptDatabase = Pick<
   OpenClawAgentKyselyDatabase,
-  "sessions" | "transcript_event_identities" | "transcript_events" | "transcript_snapshots"
+  | "session_entries"
+  | "session_routes"
+  | "sessions"
+  | "transcript_event_identities"
+  | "transcript_events"
+  | "transcript_snapshots"
 >;
 
 function normalizeSessionId(value: string): string {
@@ -271,6 +282,35 @@ function ensureTranscriptSessionRoot(params: {
           updated_at: (eb) => eb.ref("excluded.updated_at"),
         }),
       ),
+  );
+}
+
+function deleteTranscriptSessionRootIfUnused(params: {
+  database: OpenClawAgentDatabase;
+  sessionId: string;
+}): void {
+  const db = getAgentTranscriptKysely(params.database.db);
+  const countRows = (table: keyof AgentTranscriptDatabase): number => {
+    const row = executeSqliteQueryTakeFirstSync(
+      params.database.db,
+      db
+        .selectFrom(table)
+        .select((eb) => eb.fn.countAll<number | bigint>().as("count"))
+        .where("session_id", "=", params.sessionId),
+    );
+    return parseSqliteCount(row?.count);
+  };
+  if (
+    countRows("session_entries") > 0 ||
+    countRows("session_routes") > 0 ||
+    countRows("transcript_events") > 0 ||
+    countRows("transcript_snapshots") > 0
+  ) {
+    return;
+  }
+  executeSqliteQuerySync(
+    params.database.db,
+    db.deleteFrom("sessions").where("session_id", "=", params.sessionId),
   );
 }
 
@@ -492,6 +532,25 @@ function insertTranscriptEvent(params: {
   upsertTranscriptEventIdentity(params);
 }
 
+function clearSupersededMessageIdempotencyKeys(params: {
+  database: OpenClawAgentDatabase;
+  sessionId: string;
+  eventIds?: readonly string[];
+}): void {
+  const eventIds = [...new Set(params.eventIds?.filter((id) => id.trim()) ?? [])];
+  if (eventIds.length === 0) {
+    return;
+  }
+  executeSqliteQuerySync(
+    params.database.db,
+    getAgentTranscriptKysely(params.database.db)
+      .updateTable("transcript_event_identities")
+      .set({ message_idempotency_key: null })
+      .where("session_id", "=", params.sessionId)
+      .where("event_id", "in", eventIds),
+  );
+}
+
 export function resolveSqliteSessionTranscriptScope(
   options: OpenClawStateDatabaseOptions & {
     agentId?: string;
@@ -626,6 +685,38 @@ export function appendSqliteSessionTranscriptEvent(
   }, options);
 
   return { seq };
+}
+
+export function appendSqliteSessionTranscriptEvents(
+  options: AppendSqliteSessionTranscriptEventsOptions,
+): { appended: number } {
+  const { sessionId } = normalizeTranscriptScope(options);
+  if (options.events.length === 0) {
+    return { appended: 0 };
+  }
+  const now = options.now?.() ?? Date.now();
+  const appended = runOpenClawAgentWriteTransaction((database) => {
+    ensureTranscriptSessionRoot({ database, sessionId, updatedAt: now });
+    clearSupersededMessageIdempotencyKeys({
+      database,
+      sessionId,
+      eventIds: options.supersededMessageIdempotencyEventIds,
+    });
+    let nextSeq = readNextTranscriptSeq(database, sessionId);
+    for (const event of options.events) {
+      insertTranscriptEvent({
+        database,
+        sessionId,
+        seq: nextSeq,
+        event,
+        createdAt: now,
+      });
+      nextSeq += 1;
+    }
+    return options.events.length;
+  }, options);
+
+  return { appended };
 }
 
 export function appendSqliteSessionTranscriptMessage(
@@ -1221,6 +1312,7 @@ export function deleteSqliteSessionTranscript(
         .deleteFrom("transcript_events")
         .where("session_id", "=", sessionId),
     );
+    deleteTranscriptSessionRootIfUnused({ database, sessionId });
     return Number(events.numAffectedRows ?? 0) > 0;
   }, options);
   return removed;

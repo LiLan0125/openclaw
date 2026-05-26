@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { EmbeddedPiRunResult } from "../pi-embedded.js";
-import { clearCliSessionEntry, updateSessionEntryAfterAgentRun } from "./session-entry-updates.js";
+import {
+  clearCliSessionEntry,
+  recordCliCompactionInSessionEntry,
+  updateSessionEntryAfterAgentRun,
+} from "./session-entry-updates.js";
 import { resolveSession } from "./session.js";
 
 vi.mock("../model-selection.js", () => ({
@@ -599,7 +603,7 @@ describe("updateSessionEntryAfterAgentRun", () => {
   });
 
   it("persists estimated context budget status without marking stale usage fresh", async () => {
-    await withTempSessionStore(async ({ storePath }) => {
+    await withMockSessionRows(async ({ agentId }) => {
       const cfg = {} as OpenClawConfig;
       const sessionKey = "agent:main:explicit:test-context-budget-status";
       const sessionId = "test-context-budget-status-session";
@@ -611,7 +615,7 @@ describe("updateSessionEntryAfterAgentRun", () => {
           totalTokensFresh: true,
         },
       };
-      await fs.writeFile(storePath, JSON.stringify(sessionStore, null, 2));
+      await replaceMockSessionEntries(agentId, sessionStore);
 
       const result: EmbeddedPiRunResult = {
         meta: {
@@ -643,11 +647,10 @@ describe("updateSessionEntryAfterAgentRun", () => {
         },
       };
 
-      await updateSessionStoreAfterAgentRun({
+      await updateSessionEntryAfterAgentRun({
         cfg,
         sessionId,
         sessionKey,
-        storePath,
         sessionStore,
         defaultProvider: "minimax",
         defaultModel: "MiniMax-M2.7",
@@ -662,13 +665,13 @@ describe("updateSessionEntryAfterAgentRun", () => {
         contextTokenBudget: 32_000,
       });
 
-      const persisted = loadSessionStore(storePath);
+      const persisted = readMockSessionEntries(agentId);
       expect(persisted[sessionKey]?.contextBudgetStatus?.estimatedPromptTokens).toBe(18_000);
     });
   });
 
   it("clears stale estimated context budget status when a runtime refresh has no current estimate", async () => {
-    await withTempSessionStore(async ({ storePath }) => {
+    await withMockSessionRows(async ({ agentId }) => {
       const cfg = {} as OpenClawConfig;
       const sessionKey = "agent:main:explicit:test-clear-context-budget-status";
       const sessionId = "test-clear-context-budget-status-session";
@@ -699,7 +702,7 @@ describe("updateSessionEntryAfterAgentRun", () => {
           },
         },
       };
-      await fs.writeFile(storePath, JSON.stringify(sessionStore, null, 2));
+      await replaceMockSessionEntries(agentId, sessionStore);
 
       const result: EmbeddedPiRunResult = {
         meta: {
@@ -712,11 +715,10 @@ describe("updateSessionEntryAfterAgentRun", () => {
         },
       };
 
-      await updateSessionStoreAfterAgentRun({
+      await updateSessionEntryAfterAgentRun({
         cfg,
         sessionId,
         sessionKey,
-        storePath,
         sessionStore,
         defaultProvider: "minimax",
         defaultModel: "MiniMax-M2.7",
@@ -727,7 +729,7 @@ describe("updateSessionEntryAfterAgentRun", () => {
       expect(sessionStore[sessionKey]?.model).toBe("MiniMax-M2.7");
       expect(sessionStore[sessionKey]?.contextBudgetStatus).toBeUndefined();
 
-      const persisted = loadSessionStore(storePath);
+      const persisted = readMockSessionEntries(agentId);
       expect(persisted[sessionKey]?.contextBudgetStatus).toBeUndefined();
     });
   });
@@ -1194,6 +1196,119 @@ describe("updateSessionEntryAfterAgentRun", () => {
     });
   });
 
+  it("preserves user-facing run accounting while allowing session touch metadata", async () => {
+    await withMockSessionRows(async ({ agentId }) => {
+      const cfg = {
+        agents: {
+          defaults: {
+            cliBackends: {
+              "claude-cli": { command: "claude" },
+            },
+          },
+        },
+      } as OpenClawConfig;
+      const sessionKey = "agent:main:explicit:test-preserve-user-facing-run-state";
+      const sessionId = "test-preserve-user-facing-run-state-session";
+      const sessionStore: Record<string, SessionEntry> = {
+        [sessionKey]: {
+          sessionId,
+          updatedAt: 1,
+          lastInteractionAt: 10,
+          modelProvider: "anthropic",
+          model: "claude-opus-4-6",
+          contextTokens: 1_000_000,
+          inputTokens: 11,
+          outputTokens: 22,
+          totalTokens: 333,
+          totalTokensFresh: true,
+          cacheRead: 4,
+          cacheWrite: 5,
+          estimatedCostUsd: 0.25,
+          abortedLastRun: false,
+          cliSessionBindings: {
+            "claude-cli": { sessionId: "visible-cli-session" },
+          },
+          compactionCount: 7,
+        },
+      };
+      await replaceMockSessionEntries(agentId, sessionStore);
+      const freshVisibleEntry: SessionEntry = {
+        sessionId: "fresh-visible-session-id",
+        updatedAt: 2,
+        sessionStartedAt: 777,
+        lastInteractionAt: 20,
+        modelProvider: "openai",
+        model: "gpt-5.5",
+        contextTokens: 400_000,
+        inputTokens: 44,
+        outputTokens: 55,
+        totalTokens: 666,
+        totalTokensFresh: true,
+        cacheRead: 7,
+        cacheWrite: 8,
+        estimatedCostUsd: 0.5,
+        abortedLastRun: false,
+        cliSessionBindings: {
+          "claude-cli": { sessionId: "new-visible-cli-session" },
+        },
+        compactionCount: 9,
+      };
+      await replaceMockSessionEntries(agentId, { [sessionKey]: freshVisibleEntry });
+
+      const result: EmbeddedPiRunResult = {
+        meta: {
+          durationMs: 500,
+          aborted: true,
+          agentMeta: {
+            sessionId,
+            provider: "claude-cli",
+            model: "claude-sonnet-4-6",
+            contextTokens: 200_000,
+            usage: {
+              input: 100,
+              output: 50,
+              cacheRead: 10,
+              cacheWrite: 20,
+            },
+            compactionCount: 3,
+            cliSessionBinding: {
+              sessionId: "handoff-cli-session",
+            },
+          },
+        },
+      };
+
+      await updateSessionEntryAfterAgentRun({
+        cfg,
+        sessionId,
+        sessionKey,
+        sessionStore,
+        defaultProvider: "claude-cli",
+        defaultModel: "claude-sonnet-4-6",
+        result,
+        preserveUserFacingSessionModelState: true,
+      });
+
+      const next = sessionStore[sessionKey];
+      expect(next?.sessionId).toBe("fresh-visible-session-id");
+      expect(next?.sessionStartedAt).toBe(777);
+      expect(next?.modelProvider).toBe("openai");
+      expect(next?.model).toBe("gpt-5.5");
+      expect(next?.contextTokens).toBe(400_000);
+      expect(next?.inputTokens).toBe(44);
+      expect(next?.outputTokens).toBe(55);
+      expect(next?.totalTokens).toBe(666);
+      expect(next?.totalTokensFresh).toBe(true);
+      expect(next?.cacheRead).toBe(7);
+      expect(next?.cacheWrite).toBe(8);
+      expect(next?.estimatedCostUsd).toBe(0.5);
+      expect(next?.abortedLastRun).toBe(false);
+      expect(next?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe("new-visible-cli-session");
+      expect(next?.compactionCount).toBe(9);
+      expect(next?.lastInteractionAt).toBeGreaterThan(20);
+    });
+  });
+
   it("leaves contextTokens unset when entry has prior model but no contextTokens (heartbeat bleed guard)", async () => {
     await withMockSessionRows(async ({ agentId }) => {
       const cfg = {} as OpenClawConfig;
@@ -1482,6 +1597,106 @@ describe("clearCliSessionEntry", () => {
       expect(
         readMockSessionEntries(agentId)[existingKey]?.cliSessionBindings?.["claude-cli"]?.sessionId,
       ).toBe("claude-session-1");
+    });
+  });
+});
+
+describe("recordCliCompactionInSessionEntry", () => {
+  it("persists native compaction token and session id updates", async () => {
+    await withMockSessionRows(async ({ agentId }) => {
+      const sessionKey = "agent:main:explicit:test-record-compaction";
+      const entry: SessionEntry = {
+        sessionId: "openclaw-session-1",
+        updatedAt: 1,
+        totalTokens: 950,
+        totalTokensFresh: true,
+        inputTokens: 500,
+        outputTokens: 200,
+        cacheRead: 100,
+        cacheWrite: 50,
+        contextBudgetStatus: {
+          schemaVersion: 1,
+          source: "pre-prompt-estimate",
+          updatedAt: 1,
+          provider: "openai",
+          model: "gpt-5.5",
+          route: "compact_only",
+          shouldCompact: true,
+          estimatedPromptTokens: 950,
+          contextTokenBudget: 1_000,
+          promptBudgetBeforeReserve: 800,
+          reserveTokens: 200,
+          effectiveReserveTokens: 200,
+          remainingPromptBudgetTokens: 0,
+          overflowTokens: 150,
+          toolResultReducibleChars: 0,
+          messageCount: 2,
+          unwindowedMessageCount: 2,
+        },
+        cliSessionBindings: {
+          openai: { sessionId: "native-cli-session" },
+        },
+      };
+      const sessionStore: Record<string, SessionEntry> = { [sessionKey]: entry };
+      await replaceMockSessionEntries(agentId, sessionStore);
+
+      const updated = await recordCliCompactionInSessionEntry({
+        provider: "openai",
+        sessionKey,
+        sessionStore,
+        tokensAfter: 100,
+        newSessionId: "openclaw-session-2",
+      });
+
+      expect(updated).toMatchObject({
+        sessionId: "openclaw-session-2",
+        compactionCount: 1,
+        totalTokens: 100,
+        totalTokensFresh: true,
+        usageFamilyKey: sessionKey,
+      });
+      expect(updated?.usageFamilySessionIds).toEqual(["openclaw-session-1", "openclaw-session-2"]);
+      expect(updated?.cliSessionBindings?.openai).toBeUndefined();
+      expect(updated?.contextBudgetStatus).toBeUndefined();
+      expect(updated?.inputTokens).toBeUndefined();
+      expect(updated?.outputTokens).toBeUndefined();
+      expect(updated?.cacheRead).toBeUndefined();
+      expect(updated?.cacheWrite).toBeUndefined();
+      expect(sessionStore[sessionKey]).toEqual(updated);
+      expect(readMockSessionEntries(agentId)[sessionKey]).toEqual(updated);
+    });
+  });
+
+  it("marks token totals stale when compaction does not report tokensAfter", async () => {
+    await withMockSessionRows(async ({ agentId }) => {
+      const sessionKey = "agent:main:explicit:test-record-compaction-stale";
+      const entry: SessionEntry = {
+        sessionId: "openclaw-session-1",
+        updatedAt: 1,
+        totalTokens: 950,
+        totalTokensFresh: true,
+        inputTokens: 500,
+        outputTokens: 200,
+        cacheRead: 100,
+        cacheWrite: 50,
+      };
+      const sessionStore: Record<string, SessionEntry> = { [sessionKey]: entry };
+      await replaceMockSessionEntries(agentId, sessionStore);
+
+      const updated = await recordCliCompactionInSessionEntry({
+        provider: "openai",
+        sessionKey,
+        sessionStore,
+      });
+
+      expect(updated?.compactionCount).toBe(1);
+      expect(updated?.totalTokens).toBe(950);
+      expect(updated?.totalTokensFresh).toBe(false);
+      expect(updated?.inputTokens).toBeUndefined();
+      expect(updated?.outputTokens).toBeUndefined();
+      expect(updated?.cacheRead).toBeUndefined();
+      expect(updated?.cacheWrite).toBeUndefined();
+      expect(readMockSessionEntries(agentId)[sessionKey]).toEqual(updated);
     });
   });
 });

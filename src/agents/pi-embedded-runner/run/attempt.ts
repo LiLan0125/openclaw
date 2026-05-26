@@ -250,7 +250,11 @@ import {
   resolveEmbeddedAgentStreamFn,
 } from "../stream-resolution.js";
 import { applySystemPromptOverrideToSession } from "../system-prompt.js";
-import { dropReasoningFromHistory, dropThinkingBlocks } from "../thinking.js";
+import {
+  dropReasoningFromHistory,
+  dropThinkingBlocks,
+  wrapAnthropicStreamWithRecovery,
+} from "../thinking.js";
 import {
   collectAllowedToolNames,
   collectCoreBuiltinToolNames,
@@ -2172,6 +2176,7 @@ export async function runEmbeddedAttempt(
       const extensionFactories = buildEmbeddedExtensionFactories({
         cfg: params.config,
         sessionManager,
+        workspaceDir: effectiveWorkspace,
         provider: params.provider,
         modelId: params.modelId,
         model: params.model,
@@ -2707,10 +2712,10 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn = cacheTrace.wrapStreamFn(activeSession.agent.streamFn);
       }
 
-      // Anthropic Claude endpoints can reject replayed `thinking` blocks
-      // (e.g. thinkingSignature:"reasoning_text") on any follow-up provider
-      // call, including tool continuations. Wrap the stream function so every
-      // outbound request sees sanitized messages.
+      // Anthropic Claude endpoints can reject replayed `thinking` blocks on
+      // any follow-up provider call, including tool continuations. Sanitize
+      // outbound messages where policy allows rewriting; otherwise preserve
+      // latest thinking and let the recovery wrapper retry once without it.
       if (transcriptPolicy.dropThinkingBlocks || transcriptPolicy.dropReasoningFromHistory) {
         const inner = activeSession.agent.streamFn;
         activeSession.agent.streamFn = (model, context, options) => {
@@ -2734,6 +2739,18 @@ export async function runEmbeddedAttempt(
           } as unknown;
           return inner(model, nextContext as typeof context, options);
         };
+      }
+      if (
+        transcriptPolicy.preserveSignatures ||
+        transcriptPolicy.dropThinkingBlocks ||
+        transcriptPolicy.dropReasoningFromHistory
+      ) {
+        activeSession.agent.streamFn = wrapAnthropicStreamWithRecovery(
+          activeSession.agent.streamFn,
+          {
+            id: activeSession.sessionId,
+          },
+        );
       }
 
       // Mistral (and other strict providers) reject tool call IDs that don't match their
@@ -2766,6 +2783,7 @@ export async function runEmbeddedAttempt(
             preserveNativeAnthropicToolUseIds: transcriptPolicy.preserveNativeAnthropicToolUseIds,
             preserveReplaySafeThinkingToolCallIds: shouldAllowProviderOwnedThinkingReplay({
               modelApi: (model as { api?: unknown })?.api as string | null | undefined,
+              provider: params.provider,
               policy: transcriptPolicy,
             }),
             repairToolUseResultPairing: transcriptPolicy.repairToolUseResultPairing,
@@ -2822,6 +2840,7 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn,
         allowedToolNames,
         transcriptPolicy,
+        params.provider,
       );
       activeSession.agent.streamFn = wrapStreamFnTrimToolCallNames(
         activeSession.agent.streamFn,
@@ -4424,10 +4443,19 @@ export async function runEmbeddedAttempt(
 
       const toolMetasNormalized = toolMetas
         .filter(
-          (entry): entry is { toolName: string; meta?: string } =>
+          (entry): entry is { toolName: string; meta?: string; asyncStarted?: boolean } =>
             typeof entry.toolName === "string" && entry.toolName.trim().length > 0,
         )
-        .map((entry) => ({ toolName: entry.toolName, meta: entry.meta }));
+        .map((entry) => {
+          const normalized: { toolName: string; meta?: string; asyncStarted?: boolean } = {
+            toolName: entry.toolName,
+            meta: entry.meta,
+          };
+          if (entry.asyncStarted === true) {
+            normalized.asyncStarted = true;
+          }
+          return normalized;
+        });
       if (cacheObservabilityEnabled) {
         if (cacheBreak) {
           const changeSummary =
@@ -4594,6 +4622,7 @@ export async function runEmbeddedAttempt(
           replayMetadata,
           promptErrorSource,
           timedOutDuringCompaction,
+          toolMetas: toolMetasNormalized,
         },
       });
       const terminalAssistantTexts = resolveTerminalAssistantTexts({

@@ -25,6 +25,7 @@ import {
   createTestRegistry,
 } from "../../test-utils/channel-plugins.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
+import { getReplyPayloadMetadata } from "../reply-payload.js";
 import type { MsgContext } from "../templating.js";
 import { setReplyPayloadMetadata, type GetReplyOptions, type ReplyPayload } from "../types.js";
 import { PROVIDER_CONVERSATION_STATE_ERROR_USER_MESSAGE } from "./provider-request-error-classifier.js";
@@ -580,6 +581,9 @@ const automaticGroupReplyConfig = {
 let dispatchReplyFromConfig: typeof import("./dispatch-from-config.js").dispatchReplyFromConfig;
 let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
 let tryDispatchAcpReplyHook: typeof import("../../plugin-sdk/acp-runtime.js").tryDispatchAcpReplyHook;
+let createReplyOperation: typeof import("./reply-run-registry.js").createReplyOperation;
+let replyRunRegistry: typeof import("./reply-run-registry.js").replyRunRegistry;
+let replyRunTesting: typeof import("./reply-run-registry.js").__testing;
 type DispatchReplyArgs = Parameters<
   typeof import("./dispatch-from-config.js").dispatchReplyFromConfig
 >[0];
@@ -592,6 +596,11 @@ beforeAll(async () => {
   await import("./dispatch-acp-session.runtime.js");
   ({ resetInboundDedupe } = await import("./inbound-dedupe.js"));
   ({ tryDispatchAcpReplyHook } = await import("../../plugin-sdk/acp-runtime.js"));
+  ({
+    createReplyOperation,
+    replyRunRegistry,
+    __testing: replyRunTesting,
+  } = await import("./reply-run-registry.js"));
 });
 
 function createDispatcher(): ReplyDispatcher {
@@ -871,6 +880,7 @@ describe("dispatchReplyFromConfig", () => {
     clearApprovalNativeRouteStateForTest();
     acpManagerRuntimeMocks.getAcpSessionManager.mockReset();
     acpManagerRuntimeMocks.getAcpSessionManager.mockReturnValue(createMockAcpSessionManager());
+    replyRunTesting.resetReplyRunRegistry();
     resetInboundDedupe();
     mocks.routeReply.mockReset();
     mocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
@@ -967,6 +977,92 @@ describe("dispatchReplyFromConfig", () => {
     expect(runtimePluginMocks.ensureRuntimePluginsLoaded.mock.invocationCallOrder[0]).toBeLessThan(
       hookMocks.runner.hasHooks.mock.invocationCallOrder[0],
     );
+  });
+
+  it("skips pre-dispatch admission when the caller already aborted", async () => {
+    setNoAbort();
+    const sessionKey = "agent:main:telegram:group:-1003774691294:topic:3731";
+    const activeOperation = createReplyOperation({
+      sessionKey,
+      sessionId: "active-session",
+      resetTriggered: false,
+    });
+    activeOperation.setPhase("running");
+    const abortController = new AbortController();
+    const dispatcher = createDispatcher();
+    const replyResolver = vi.fn(async () => ({ text: "should not run" }) satisfies ReplyPayload);
+
+    abortController.abort();
+
+    const result = await dispatchReplyFromConfig({
+      ctx: buildTestCtx({
+        Provider: "telegram",
+        Surface: "telegram",
+        OriginatingChannel: "telegram",
+        SessionKey: sessionKey,
+        ChatType: "group",
+        IsForum: true,
+        MessageSid: "27784",
+        MessageThreadId: 3731,
+        TransportThreadId: 3731,
+        To: "telegram:-1003774691294:topic:3731",
+        BodyForAgent: "superseded while waiting",
+      }),
+      cfg: automaticGroupReplyConfig,
+      dispatcher,
+      replyOptions: { abortSignal: abortController.signal },
+      replyResolver,
+    });
+
+    expect(result).toMatchObject({
+      queuedFinal: false,
+      counts: { tool: 0, block: 0, final: 0 },
+    });
+    expect(replyResolver).not.toHaveBeenCalled();
+    activeOperation.complete();
+  });
+
+  it("skips a Telegram topic heartbeat turn while a reply operation is active", async () => {
+    setNoAbort();
+    const sessionKey = "agent:main:telegram:group:-1003774691294:topic:3731";
+    const activeOperation = createReplyOperation({
+      sessionKey,
+      sessionId: "user-session",
+      resetTriggered: false,
+    });
+    activeOperation.setPhase("running");
+    const dispatcher = createDispatcher();
+    const replyResolver = vi.fn(
+      async () => ({ text: "heartbeat should not run" }) satisfies ReplyPayload,
+    );
+
+    const result = await dispatchReplyFromConfig({
+      ctx: buildTestCtx({
+        Provider: "telegram",
+        Surface: "telegram",
+        OriginatingChannel: "telegram",
+        SessionKey: sessionKey,
+        ChatType: "group",
+        IsForum: true,
+        MessageSid: "heartbeat",
+        MessageThreadId: 3731,
+        TransportThreadId: 3731,
+        To: "telegram:-1003774691294:topic:3731",
+        BodyForAgent: "[OpenClaw heartbeat poll]",
+      }),
+      cfg: automaticGroupReplyConfig,
+      dispatcher,
+      replyOptions: { isHeartbeat: true },
+      replyResolver,
+    });
+
+    expect(result).toMatchObject({
+      queuedFinal: false,
+      counts: { tool: 0, block: 0, final: 0 },
+    });
+    expect(replyResolver).not.toHaveBeenCalled();
+    expect(replyRunRegistry.get(sessionKey)).toBe(activeOperation);
+    activeOperation.complete();
   });
 
   it("does not route when Provider matches OriginatingChannel (even if Surface is missing)", async () => {
@@ -6320,6 +6416,53 @@ describe("sendPolicy deny — suppress delivery, not processing (#53328)", () =>
       idempotencyKey: "run-1:internal-source-reply:0",
       updateMode: "inline",
       config: emptyConfig,
+    });
+  });
+
+  it("keeps internal source reply metadata on TTS-cloned final payloads", async () => {
+    setNoAbort();
+    ttsMocks.state.synthesizeFinalAudio = true;
+    sessionStoreMocks.currentEntry = {
+      sessionId: "s1",
+      updatedAt: 0,
+      sendPolicy: "allow",
+    };
+    const dispatcher = createDispatcher();
+    const sourceReply = setReplyPayloadMetadata(
+      { text: "message tool reply" },
+      {
+        deliverDespiteSourceReplySuppression: true,
+        sourceReplyTranscriptMirror: {
+          sessionKey: "agent:main",
+          agentId: "main",
+          text: "message tool reply",
+          idempotencyKey: "run-tts:internal-source-reply:0",
+        },
+      },
+    );
+    const replyResolver = vi.fn(async () => sourceReply satisfies ReplyPayload);
+
+    const result = await dispatchReplyFromConfig({
+      ctx: buildTestCtx({ Provider: "webchat", Surface: "webchat", SessionKey: "agent:main" }),
+      cfg: emptyConfig,
+      dispatcher,
+      replyResolver,
+      replyOptions: {
+        sourceReplyDeliveryMode: "message_tool_only",
+      },
+    });
+
+    expect(result.queuedFinal).toBe(true);
+    const queuedPayload = (dispatcher.sendFinalReply as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0];
+    expect(queuedPayload).toMatchObject({
+      text: "message tool reply",
+      mediaUrl: "https://example.com/tts-synth.opus",
+      audioAsVoice: true,
+    });
+    expect(getReplyPayloadMetadata(queuedPayload)?.sourceReplyTranscriptMirror).toMatchObject({
+      sessionKey: "agent:main",
+      idempotencyKey: "run-tts:internal-source-reply:0",
     });
   });
 

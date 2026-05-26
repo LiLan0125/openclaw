@@ -7,11 +7,12 @@ import type {
   PluginHookGatewayContext,
   PluginHookGatewayStartEvent,
 } from "../plugins/hook-types.js";
+import type { PluginServicesHandle } from "../plugins/services.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { withEnvAsync } from "../test-utils/env.js";
 
 const hoisted = vi.hoisted(() => {
-  const startPluginServices = vi.fn(async () => null);
+  const startPluginServices = vi.fn<() => Promise<PluginServicesHandle | null>>(async () => null);
   const startGmailWatcherWithLogs = vi.fn(async () => {});
   const loadInternalHooks = vi.fn(async () => 0);
   const setInternalHooksEnabled = vi.fn();
@@ -47,6 +48,10 @@ const hoisted = vi.hoisted(() => {
     allowed: true,
     inCatalog: true,
   }));
+  const resolveAgentModelPrimaryValue = vi.fn((model?: unknown) =>
+    typeof model === "string" ? model : undefined,
+  );
+  const resolveDefaultAgentDir = vi.fn(() => "/tmp/openclaw-state/agents/main/agent");
   const resolveEmbeddedAgentRuntime = vi.fn(() => "pi");
   const ensureOpenClawModelCatalog = vi.fn(async () => undefined);
   const ensureOpenClawModelsJson = ensureOpenClawModelCatalog;
@@ -77,6 +82,8 @@ const hoisted = vi.hoisted(() => {
     resolveHooksGmailModel,
     loadModelCatalog,
     getModelRefStatus,
+    resolveAgentModelPrimaryValue,
+    resolveDefaultAgentDir,
     resolveEmbeddedAgentRuntime,
     ensureOpenClawModelCatalog,
     ensureOpenClawModelsJson,
@@ -89,6 +96,16 @@ const hoisted = vi.hoisted(() => {
 vi.mock("../agents/subagent-registry.js", () => ({
   scheduleSubagentOrphanRecovery: hoisted.scheduleSubagentOrphanRecovery,
 }));
+
+vi.mock("../agents/agent-scope.js", async () => {
+  const actual = await vi.importActual<typeof import("../agents/agent-scope.js")>(
+    "../agents/agent-scope.js",
+  );
+  return {
+    ...actual,
+    resolveDefaultAgentDir: hoisted.resolveDefaultAgentDir,
+  };
+});
 
 vi.mock("../config/paths.js", async () => {
   const actual = await vi.importActual<typeof import("../config/paths.js")>("../config/paths.js");
@@ -167,14 +184,31 @@ vi.mock("../agents/pi-embedded-runner/runtime.js", () => ({
   resolveEmbeddedAgentRuntime: hoisted.resolveEmbeddedAgentRuntime,
 }));
 
-vi.mock("../agents/models-config.js", () => ({
-  ensureOpenClawModelCatalog: hoisted.ensureOpenClawModelCatalog,
-}));
+vi.mock("../agents/models-config.js", async () => {
+  const actual = await vi.importActual<typeof import("../agents/models-config.js")>(
+    "../agents/models-config.js",
+  );
+  return {
+    ...actual,
+    ensureOpenClawModelCatalog: hoisted.ensureOpenClawModelCatalog,
+    ensureOpenClawModelsJson: hoisted.ensureOpenClawModelsJson,
+  };
+});
 
 vi.mock("../agents/model-provider-auth.js", () => ({
   clearCurrentProviderAuthState: hoisted.clearCurrentProviderAuthState,
   warmCurrentProviderAuthState: hoisted.warmCurrentProviderAuthState,
 }));
+
+vi.mock("../config/model-input.js", async () => {
+  const actual = await vi.importActual<typeof import("../config/model-input.js")>(
+    "../config/model-input.js",
+  );
+  return {
+    ...actual,
+    resolveAgentModelPrimaryValue: hoisted.resolveAgentModelPrimaryValue,
+  };
+});
 
 vi.mock("../agents/auth-profiles.js", async () => {
   const actual = await vi.importActual<typeof import("../agents/auth-profiles.js")>(
@@ -960,6 +994,10 @@ describe("startGatewayPostAttachRuntime", () => {
     } as never;
     hoisted.resolveAgentModelPrimaryValue.mockReturnValue("openai/gpt-5.4");
     hoisted.resolveDefaultAgentDir.mockReturnValue("/tmp/openclaw-state/agents/ops/agent");
+    const modelsConfig = await import("../agents/models-config.js");
+    const ensureOpenClawModelCatalog = vi
+      .spyOn(modelsConfig, "ensureOpenClawModelCatalog")
+      .mockResolvedValue(undefined);
 
     await __testing.prewarmConfiguredPrimaryModel({
       cfg,
@@ -968,7 +1006,7 @@ describe("startGatewayPostAttachRuntime", () => {
     });
 
     expect(hoisted.resolveDefaultAgentDir).toHaveBeenCalledWith(cfg);
-    expect(hoisted.ensureOpenClawModelCatalog).toHaveBeenCalledWith(
+    expect(ensureOpenClawModelCatalog).toHaveBeenCalledWith(
       cfg,
       "/tmp/openclaw-state/agents/ops/agent",
       expect.objectContaining({
@@ -1013,25 +1051,36 @@ describe("startGatewayPostAttachRuntime", () => {
     );
   });
 
-  it("starts and reports plugin services before channel startup completion", async () => {
+  it("starts and reports plugin services after channel startup completes", async () => {
     await withEnvAsync(
       { OPENCLAW_SKIP_CHANNELS: undefined, OPENCLAW_SKIP_PROVIDERS: undefined },
       async () => {
         let releaseChannels: (() => void) | undefined;
-        const pluginServices = { stop: vi.fn(async () => {}) } as never;
+        const events: string[] = [];
+        const pluginServices: PluginServicesHandle = { stop: vi.fn(async () => {}) };
         const onPluginServices = vi.fn();
         const onSidecarsReady = vi.fn();
         const startChannels = vi.fn(
           () =>
             new Promise<void>((resolve) => {
-              releaseChannels = resolve;
+              events.push("channels-start");
+              releaseChannels = () => {
+                events.push("channels-end");
+                resolve();
+              };
             }),
         );
-        hoisted.startPluginServices.mockResolvedValueOnce(pluginServices);
+        hoisted.startPluginServices.mockImplementationOnce(async () => {
+          events.push("plugin-services");
+          return pluginServices;
+        });
 
         await startGatewayPostAttachRuntime({
           ...createPostAttachParams({
             deferSidecars: true,
+            onChannelsStarted: async () => {
+              events.push("channels-started");
+            },
             onPluginServices,
             onSidecarsReady,
           }),
@@ -1040,9 +1089,9 @@ describe("startGatewayPostAttachRuntime", () => {
 
         await vi.waitFor(() => {
           expect(startChannels).toHaveBeenCalledTimes(1);
-          expect(hoisted.startPluginServices).toHaveBeenCalledTimes(1);
-          expect(onPluginServices).toHaveBeenCalledWith(pluginServices);
         });
+        expect(hoisted.startPluginServices).not.toHaveBeenCalled();
+        expect(onPluginServices).not.toHaveBeenCalled();
         expect(onSidecarsReady).not.toHaveBeenCalled();
 
         if (!releaseChannels) {
@@ -1050,9 +1099,113 @@ describe("startGatewayPostAttachRuntime", () => {
         }
         releaseChannels();
         await vi.waitFor(() => {
+          expect(hoisted.startPluginServices).toHaveBeenCalledTimes(1);
+          expect(onPluginServices).toHaveBeenCalledWith(pluginServices);
           expect(onSidecarsReady).toHaveBeenCalledTimes(1);
         });
+        expect(events).toEqual([
+          "channels-start",
+          "channels-end",
+          "channels-started",
+          "plugin-services",
+        ]);
         expect(onPluginServices).toHaveBeenCalledTimes(1);
+      },
+    );
+  });
+
+  it("does not start plugin services after deferred close starts during channel startup", async () => {
+    await withEnvAsync(
+      { OPENCLAW_SKIP_CHANNELS: undefined, OPENCLAW_SKIP_PROVIDERS: undefined },
+      async () => {
+        let closing = false;
+        let releaseChannels: (() => void) | undefined;
+        const onPluginServices = vi.fn();
+        const onSidecarsReady = vi.fn();
+        const startChannels = vi.fn(
+          () =>
+            new Promise<void>((resolve) => {
+              releaseChannels = resolve;
+            }),
+        );
+
+        await startGatewayPostAttachRuntime({
+          ...createPostAttachParams({
+            deferSidecars: true,
+            onPluginServices,
+            onSidecarsReady,
+          }),
+          startChannels,
+          isClosing: () => closing,
+        });
+
+        await vi.waitFor(() => {
+          expect(startChannels).toHaveBeenCalledTimes(1);
+        });
+        closing = true;
+
+        if (!releaseChannels) {
+          throw new Error("Expected channel startup release callback to be initialized");
+        }
+        releaseChannels();
+
+        await vi.waitFor(() => {
+          expect(onSidecarsReady).toHaveBeenCalledTimes(1);
+        });
+        expect(hoisted.startPluginServices).not.toHaveBeenCalled();
+        expect(onPluginServices).toHaveBeenCalledWith(null);
+      },
+    );
+  });
+
+  it("stops plugin services that finish starting after deferred close begins", async () => {
+    await withEnvAsync(
+      { OPENCLAW_SKIP_CHANNELS: undefined, OPENCLAW_SKIP_PROVIDERS: undefined },
+      async () => {
+        let shouldStartPluginServices = true;
+        let releasePluginServices: (() => void) | undefined;
+        const pluginServices: PluginServicesHandle = { stop: vi.fn(async () => {}) };
+        const onPluginServices = vi.fn();
+        hoisted.startPluginServices.mockImplementationOnce(
+          async () =>
+            (await new Promise<typeof pluginServices>((resolve) => {
+              releasePluginServices = () => resolve(pluginServices);
+            })) as never,
+        );
+
+        const sidecarsPromise = startGatewaySidecars({
+          cfg: { hooks: { internal: { enabled: false } } } as never,
+          pluginRegistry: createPostAttachParams().pluginRegistry,
+          defaultWorkspaceDir: "/tmp/openclaw-workspace",
+          deps: {} as never,
+          startChannels: vi.fn(async () => {}),
+          shouldStartPluginServices: () => shouldStartPluginServices,
+          onPluginServices,
+          log: { warn: vi.fn() },
+          logHooks: {
+            info: vi.fn(),
+            warn: vi.fn(),
+            error: vi.fn(),
+          },
+          logChannels: {
+            info: vi.fn(),
+            error: vi.fn(),
+          },
+        });
+
+        await vi.waitFor(() => {
+          expect(hoisted.startPluginServices).toHaveBeenCalledTimes(1);
+        });
+        shouldStartPluginServices = false;
+
+        if (!releasePluginServices) {
+          throw new Error("Expected plugin service release callback to be initialized");
+        }
+        releasePluginServices();
+        await expect(sidecarsPromise).resolves.toMatchObject({ pluginServices: null });
+
+        expect(pluginServices.stop).toHaveBeenCalledTimes(1);
+        expect(onPluginServices).toHaveBeenCalledWith(null);
       },
     );
   });
@@ -1096,6 +1249,14 @@ describe("startGatewayPostAttachRuntime", () => {
         );
 
         await vi.waitFor(() => {
+          expect(startChannels).toHaveBeenCalledTimes(1);
+        });
+
+        if (!releaseChannels) {
+          throw new Error("Expected channel startup release callback to be initialized");
+        }
+        releaseChannels();
+        await vi.waitFor(() => {
           expect(onPluginServices).toHaveBeenCalledWith(pluginServices);
         });
 
@@ -1104,11 +1265,6 @@ describe("startGatewayPostAttachRuntime", () => {
         }
         releaseStartupLog();
         await expect(runtimePromise).resolves.toMatchObject({ pluginServices });
-
-        if (!releaseChannels) {
-          throw new Error("Expected channel startup release callback to be initialized");
-        }
-        releaseChannels();
         await vi.waitFor(() => {
           expect(onSidecarsReady).toHaveBeenCalledTimes(1);
         });

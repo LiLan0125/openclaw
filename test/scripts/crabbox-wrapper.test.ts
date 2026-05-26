@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,6 +10,12 @@ const repoRoot = process.cwd();
 function makeFakeCrabbox(helpText: string): string {
   const binDir = mkdtempSync(path.join(tmpdir(), "openclaw-fake-crabbox-"));
   tempDirs.push(binDir);
+  writeFakeCrabbox(binDir, helpText);
+  return binDir;
+}
+
+function writeFakeCrabbox(binDir: string, helpText: string): string {
+  mkdirSync(binDir, { recursive: true });
   const crabboxPath = path.join(binDir, "crabbox");
   const script = [
     "#!/usr/bin/env node",
@@ -31,10 +37,12 @@ function makeFakeCrabbox(helpText: string): string {
     "utf8",
   );
   chmodSync(crabboxPath, 0o755);
-  return binDir;
+  return crabboxPath;
 }
 
-function makeFakeGit(responses: Record<string, { status?: number; stdout?: string; stderr?: string }>): string {
+function makeFakeGit(
+  responses: Record<string, { status?: number; stdout?: string; stderr?: string }>,
+): string {
   const binDir = mkdtempSync(path.join(tmpdir(), "openclaw-fake-git-"));
   tempDirs.push(binDir);
   const gitPath = path.join(binDir, "git");
@@ -45,6 +53,7 @@ function makeFakeGit(responses: Record<string, { status?: number; stdout?: strin
     "const args = process.argv.slice(2);",
     "if (args[0] === 'worktree' && args[1] === 'add') { fs.mkdirSync(args[3], { recursive: true }); process.exit(0); }",
     "if (args[0] === '-C' && args[2] === 'sparse-checkout' && args[3] === 'disable') { process.exit(0); }",
+    "if (args[0] === '-C' && args[2] === 'reset' && args[3] === '--mixed') { process.exit(0); }",
     "if (args[0] === 'worktree' && args[1] === 'remove') { process.exit(0); }",
     "const key = args.join('\\u0000');",
     "const response = responses.get(key);",
@@ -84,7 +93,10 @@ function runWrapper(
   });
 }
 
-function parseFakeCrabboxOutput(result: ReturnType<typeof runWrapper>): { args: string[]; cwd: string } {
+function parseFakeCrabboxOutput(result: ReturnType<typeof runWrapper>): {
+  args: string[];
+  cwd: string;
+} {
   return JSON.parse(result.stdout.trim()) as { args: string[]; cwd: string };
 }
 
@@ -103,6 +115,123 @@ describe("scripts/crabbox-wrapper", () => {
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('"local-container"');
+  });
+
+  it("defaults AWS macOS runs to on-demand capacity", () => {
+    const result = runWrapper(
+      "provider: hetzner, aws, local-container, blacksmith-testbox, or cloudflare\n",
+      ["run", "--provider", "aws", "--target", "macos", "--", "echo ok"],
+    );
+
+    expect(result.status).toBe(0);
+    expect(parseFakeCrabboxOutput(result).args).toEqual([
+      "run",
+      "--provider",
+      "aws",
+      "--target",
+      "macos",
+      "--market",
+      "on-demand",
+      "--",
+      "echo ok",
+    ]);
+  });
+
+  it("defaults AWS macOS warmups to on-demand capacity", () => {
+    const result = runWrapper(
+      "provider: hetzner, aws, local-container, blacksmith-testbox, or cloudflare\n",
+      ["warmup", "--provider", "aws", "--target", "macos"],
+    );
+
+    expect(result.status).toBe(0);
+    expect(parseFakeCrabboxOutput(result).args).toEqual([
+      "warmup",
+      "--provider",
+      "aws",
+      "--target",
+      "macos",
+      "--market",
+      "on-demand",
+    ]);
+  });
+
+  it("does not override explicit AWS macOS market or lease selections", () => {
+    const helpText = "provider: hetzner, aws, local-container, blacksmith-testbox, or cloudflare\n";
+    const explicitMarket = runWrapper(helpText, [
+      "run",
+      "--provider",
+      "aws",
+      "--target=macos",
+      "--market",
+      "spot",
+      "--",
+      "echo ok",
+    ]);
+    const existingLease = runWrapper(helpText, [
+      "run",
+      "--provider",
+      "aws",
+      "--target",
+      "macos",
+      "--id",
+      "cbx_existing",
+      "--",
+      "echo ok",
+    ]);
+
+    expect(explicitMarket.status).toBe(0);
+    expect(parseFakeCrabboxOutput(explicitMarket).args).toEqual([
+      "run",
+      "--provider",
+      "aws",
+      "--target=macos",
+      "--market",
+      "spot",
+      "--",
+      "echo ok",
+    ]);
+    expect(existingLease.status).toBe(0);
+    expect(parseFakeCrabboxOutput(existingLease).args).toEqual([
+      "run",
+      "--provider",
+      "aws",
+      "--target",
+      "macos",
+      "--id",
+      "cbx_existing",
+      "--",
+      "echo ok",
+    ]);
+  });
+
+  it("finds a Crabbox checkout next to the Git common dir in linked worktrees", () => {
+    const fakeWorkspaceParent = mkdtempSync(path.join(tmpdir(), "openclaw-linked-worktree-"));
+    tempDirs.push(fakeWorkspaceParent);
+    const gitCommonDir = path.join(fakeWorkspaceParent, "openclaw", ".git");
+    const crabboxBinDir = path.join(fakeWorkspaceParent, "crabbox", "bin");
+    mkdirSync(gitCommonDir, { recursive: true });
+    writeFakeCrabbox(crabboxBinDir, "provider: aws\n");
+    const gitResponses = {
+      ["rev-parse\u0000--git-common-dir"]: { stdout: `${gitCommonDir}\n` },
+    };
+    const gitBinDir = makeFakeGit(gitResponses);
+
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/crabbox-wrapper.mjs", "run", "--provider", "aws", "--", "echo ok"],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_FAKE_GIT_RESPONSES: JSON.stringify(gitResponses),
+          PATH: [gitBinDir, path.dirname(process.execPath)].join(path.delimiter),
+        },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(parseFakeCrabboxOutput(result).args).toContain("aws");
   });
 
   it("accepts advertised providers from wrapped Crabbox help", () => {
@@ -137,16 +266,35 @@ describe("scripts/crabbox-wrapper", () => {
       const staleBinDir = mkdtempSync(path.join(tmpdir(), "openclaw-stale-crabbox-"));
       tempDirs.push(staleBinDir);
       writeFileSync(path.join(staleBinDir, "crabbox"), "not executable\n", "utf8");
-      const result = runWrapper(
-        "provider: aws\n",
-        ["run", "--provider", "aws", "--", "echo ok"],
-        { extraPathEntries: [staleBinDir] },
-      );
+      const result = runWrapper("provider: aws\n", ["run", "--provider", "aws", "--", "echo ok"], {
+        extraPathEntries: [staleBinDir],
+      });
 
       expect(result.status).toBe(0);
       expect(parseFakeCrabboxOutput(result).args).toContain("aws");
     });
   }
+
+  it("falls back to normal sync decisions when git is missing from PATH", () => {
+    const binDir = makeFakeCrabbox(
+      "provider: hetzner, aws, local-container, blacksmith-testbox, or cloudflare\n",
+    );
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/crabbox-wrapper.mjs", "run", "--provider", "aws", "--", "echo ok"],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: [binDir, path.dirname(process.execPath)].join(path.delimiter),
+        },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(parseFakeCrabboxOutput(result).args).toContain("aws");
+  });
 
   it("accepts Crabbox provider aliases when their canonical provider is advertised", () => {
     const helpText = [
@@ -248,6 +396,58 @@ describe("scripts/crabbox-wrapper", () => {
     expect(parseFakeCrabboxOutput(result).cwd).toContain("openclaw-crabbox-sync-");
   });
 
+  it("uses a temporary full checkout for clean sparse AWS syncs", () => {
+    const result = runWrapper(
+      "provider: hetzner, aws, local-container, blacksmith-testbox, or cloudflare\n",
+      ["run", "--provider", "aws", "--", "corepack", "pnpm", "check:changed"],
+      {
+        gitResponses: {
+          ["config\u0000--bool\u0000core.sparseCheckout"]: { stdout: "true\n" },
+          ["status\u0000--porcelain=v1"]: { stdout: "" },
+        },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("syncing from temporary full checkout");
+    expect(result.stderr).toContain("overlaying local HEAD as worktree changes from origin/main");
+    expect(parseFakeCrabboxOutput(result).cwd).toContain("openclaw-crabbox-sync-");
+  });
+
+  it("keeps clean sparse local-container syncs on the original checkout", () => {
+    const result = runWrapper(
+      "provider: hetzner, aws, local-container, blacksmith-testbox, or cloudflare\n",
+      ["run", "--provider", "local-container", "--", "echo ok"],
+      {
+        gitResponses: {
+          ["config\u0000--bool\u0000core.sparseCheckout"]: { stdout: "true\n" },
+          ["status\u0000--porcelain=v1"]: { stdout: "" },
+        },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain("syncing from temporary full checkout");
+    expect(parseFakeCrabboxOutput(result).cwd).toBe(repoRoot);
+  });
+
+  it("keeps existing AWS leases on the original sparse checkout", () => {
+    const result = runWrapper(
+      "provider: hetzner, aws, local-container, blacksmith-testbox, or cloudflare\n",
+      ["run", "--provider", "aws", "--id", "cbx_existing", "--", "echo ok"],
+      {
+        gitResponses: {
+          ["config\u0000--bool\u0000core.sparseCheckout"]: { stdout: "true\n" },
+          ["status\u0000--porcelain=v1"]: { stdout: "" },
+        },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain("syncing from temporary full checkout");
+    expect(parseFakeCrabboxOutput(result).cwd).toBe(repoRoot);
+  });
+
   it("uses a temporary full checkout when clean sparse branches differ from the Blacksmith ref", () => {
     const result = runWrapper(
       "provider: hetzner, aws, local-container, blacksmith-testbox, or cloudflare\n",
@@ -311,7 +511,9 @@ describe("scripts/crabbox-wrapper", () => {
     const output = parseFakeCrabboxOutput(result);
     expect(result.status).toBe(0);
     expect(output.cwd).toContain("openclaw-crabbox-sync-");
-    expect(output.args).toContain(`--capture-stdout=${path.join(repoRoot, ".artifacts/stdout.log")}`);
+    expect(output.args).toContain(
+      `--capture-stdout=${path.join(repoRoot, ".artifacts/stdout.log")}`,
+    );
     expect(output.args).toContain(path.join(repoRoot, ".artifacts/stderr.log"));
     expect(output.args).toContain(`/tmp/proof=${path.join(repoRoot, ".artifacts/proof")}`);
   });

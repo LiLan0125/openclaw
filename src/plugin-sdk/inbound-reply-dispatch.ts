@@ -240,10 +240,10 @@ export async function recordChannelMessageReplyDispatch(
       });
       throwIfDurableInboundReplyDeliveryFailed(durable);
       if (isDurableInboundReplyDeliveryHandled(durable)) {
-        return;
+        return durable.delivery;
       }
     }
-    await params.deliver(normalized);
+    return await params.deliver(normalized);
   };
 
   await runPreparedChannelTurn({

@@ -26,7 +26,7 @@ import {
   type LoadInstalledPluginIndexParams,
   type RefreshInstalledPluginIndexParams,
 } from "./installed-plugin-index-types.js";
-import { clearRegisteredPluginMetadataSnapshotMemo } from "./plugin-metadata-snapshot-memo.js";
+import { clearPluginMetadataLifecycleCaches } from "./plugin-metadata-lifecycle.js";
 export {
   readPersistedInstalledPluginIndex,
   readPersistedInstalledPluginIndexSync,
@@ -50,7 +50,7 @@ function withInstalledPluginIndexWarning(index: InstalledPluginIndex): Installed
 
 function clearInstalledPluginMetadataCaches(): void {
   clearCurrentPluginMetadataSnapshotState();
-  clearRegisteredPluginMetadataSnapshotMemo();
+  clearPluginMetadataLifecycleCaches();
 }
 
 export async function writePersistedInstalledPluginIndex(

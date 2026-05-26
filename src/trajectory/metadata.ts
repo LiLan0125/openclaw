@@ -61,7 +61,7 @@ type BuildTrajectoryArtifactsParams = {
     completedCount: number;
     activeCount: number;
   };
-  toolMetas: Array<{ toolName: string; meta?: string }>;
+  toolMetas: Array<{ toolName: string; meta?: string; asyncStarted?: boolean }>;
   didSendViaMessagingTool: boolean;
   successfulCronAdds: number;
   messagingToolSentTexts: string[];

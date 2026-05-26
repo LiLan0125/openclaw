@@ -26,6 +26,8 @@ let sessionRunAccounting: typeof import("./session-run-accounting.js");
 let setRuntimeConfigSnapshot: typeof import("../../config/config.js").setRuntimeConfigSnapshot;
 let createMockFollowupRun: typeof import("./test-helpers.js").createMockFollowupRun;
 let createMockTypingController: typeof import("./test-helpers.js").createMockTypingController;
+let createReplyOperationForTest: typeof import("./reply-run-registry.js").createReplyOperation;
+let replyRunTestingForTest: typeof import("./reply-run-registry.js").testing;
 const FOLLOWUP_DEBUG = process.env.OPENCLAW_DEBUG_FOLLOWUP_RUNNER_TEST === "1";
 const FOLLOWUP_TEST_QUEUES = new Map<
   string,
@@ -274,28 +276,39 @@ async function persistRunSessionUsageForFollowupTest(
   if (!entry) {
     return;
   }
+  const preserveSessionModelState =
+    params.isHeartbeat === true || params.preserveUserFacingSessionModelState === true;
+  const preserveUserFacingRunState = params.preserveUserFacingSessionModelState === true;
   const nextEntry: SessionEntry = {
     ...entry,
     updatedAt: Date.now(),
-    modelProvider: params.providerUsed ?? entry.modelProvider,
-    model: params.modelUsed ?? entry.model,
-    contextTokens: params.contextTokensUsed ?? entry.contextTokens,
-    systemPromptReport: params.systemPromptReport ?? entry.systemPromptReport,
+    modelProvider: preserveSessionModelState
+      ? entry.modelProvider
+      : (params.providerUsed ?? entry.modelProvider),
+    model: preserveSessionModelState ? entry.model : (params.modelUsed ?? entry.model),
+    contextTokens: preserveUserFacingRunState
+      ? entry.contextTokens
+      : (params.contextTokensUsed ?? entry.contextTokens),
+    systemPromptReport: preserveUserFacingRunState
+      ? entry.systemPromptReport
+      : (params.systemPromptReport ?? entry.systemPromptReport),
   };
-  if (params.usage) {
+  if (params.usage && !preserveUserFacingRunState) {
     nextEntry.inputTokens = params.usage.input ?? 0;
     nextEntry.outputTokens = params.usage.output ?? 0;
     const cacheUsage = params.lastCallUsage ?? params.usage;
     nextEntry.cacheRead = cacheUsage?.cacheRead ?? 0;
     nextEntry.cacheWrite = cacheUsage?.cacheWrite ?? 0;
   }
-  const promptTokens =
-    params.promptTokens ??
-    (params.lastCallUsage?.input ?? params.usage?.input ?? 0) +
-      (params.lastCallUsage?.cacheRead ?? params.usage?.cacheRead ?? 0) +
-      (params.lastCallUsage?.cacheWrite ?? params.usage?.cacheWrite ?? 0);
-  nextEntry.totalTokens = promptTokens > 0 ? promptTokens : undefined;
-  nextEntry.totalTokensFresh = promptTokens > 0;
+  if (!preserveUserFacingRunState) {
+    const promptTokens =
+      params.promptTokens ??
+      (params.lastCallUsage?.input ?? params.usage?.input ?? 0) +
+        (params.lastCallUsage?.cacheRead ?? params.usage?.cacheRead ?? 0) +
+        (params.lastCallUsage?.cacheWrite ?? params.usage?.cacheWrite ?? 0);
+    nextEntry.totalTokens = promptTokens > 0 ? promptTokens : undefined;
+    nextEntry.totalTokensFresh = promptTokens > 0;
+  }
   store[sessionKey] = nextEntry;
 }
 
@@ -400,6 +413,8 @@ async function loadFreshFollowupRunnerModuleForTest() {
   ({ clearFollowupQueue, enqueueFollowupRun } = await import("./queue.js"));
   sessionRunAccounting = await import("./session-run-accounting.js");
   ({ createMockFollowupRun, createMockTypingController } = await import("./test-helpers.js"));
+  ({ createReplyOperation: createReplyOperationForTest, testing: replyRunTestingForTest } =
+    await import("./reply-run-registry.js"));
 }
 
 const ROUTABLE_TEST_CHANNELS = new Set([
@@ -417,6 +432,7 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
+  replyRunTestingForTest?.resetReplyRunRegistry();
   clearRuntimeConfigSnapshot?.();
   runEmbeddedPiAgentMock.mockReset();
   compactEmbeddedPiSessionMock.mockReset();
@@ -454,6 +470,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  replyRunTestingForTest?.resetReplyRunRegistry();
   clearRuntimeConfigSnapshot?.();
   clearFollowupQueue("main");
   FOLLOWUP_TEST_QUEUES.clear();
@@ -482,6 +499,60 @@ function createQueuedRun(
 ): FollowupRun {
   return createMockFollowupRun(overrides);
 }
+
+describe("createFollowupRunner reply-lane admission", () => {
+  it("runs queued followups with the session id returned by admission", async () => {
+    const active = createReplyOperationForTest({
+      sessionKey: "main",
+      sessionId: "pre-compact-session",
+      resetTriggered: false,
+    });
+    active.setPhase("preflight_compacting");
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [],
+      meta: { agentMeta: { provider: "anthropic", model: "claude" } },
+    });
+    const sessionStore = {
+      main: {
+        sessionId: "pre-compact-session",
+        sessionFile: "/tmp/pre-compact.jsonl",
+        updatedAt: Date.now(),
+      },
+    };
+    const runner = createFollowupRunner({
+      typing: createMockTypingController(),
+      typingMode: "instant",
+      sessionEntry: sessionStore.main,
+      sessionStore,
+      sessionKey: "main",
+      defaultModel: "anthropic/claude",
+    });
+
+    const pending = runner(
+      createQueuedRun({
+        run: {
+          sessionId: "queued-stale-session",
+          sessionKey: "main",
+          provider: "anthropic",
+          model: "claude",
+        },
+      }),
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    active.updateSessionId("post-compact-session");
+    sessionStore.main = {
+      sessionId: "post-compact-session",
+      sessionFile: "/tmp/post-compact.jsonl",
+      updatedAt: Date.now(),
+    };
+    active.complete();
+    await pending;
+
+    const call = requireLastMockCallArg(runEmbeddedPiAgentMock, "run embedded pi agent");
+    expect(call.sessionId).toBe("post-compact-session");
+    expect(call.sessionFile).toBe("/tmp/post-compact.jsonl");
+  });
+});
 
 async function normalizeComparablePath(filePath: string): Promise<string> {
   const parent = await fs.realpath(path.dirname(filePath)).catch(() => path.dirname(filePath));
@@ -2009,6 +2080,77 @@ describe("createFollowupRunner messaging delivery and dedupe", () => {
 
     expect(requireMockCallArg(persistSpy, 0).providerUsed).toBe("anthropic");
     expect(requireMockCallArg(persistSpy, 0).usageIsContextSnapshot).toBeUndefined();
+    persistSpy.mockRestore();
+  });
+
+  it("preserves user-facing session model state for queued internal announce fallback", async () => {
+    const storePath = "/tmp/openclaw-followup-internal-announce-usage.json";
+    const sessionKey = "main";
+    const sessionEntry: SessionEntry = {
+      sessionId: "session",
+      updatedAt: Date.now(),
+      modelProvider: "openai-codex",
+      model: "gpt-5.5",
+      contextTokens: 200_000,
+      inputTokens: 1_234,
+      outputTokens: 56,
+      cacheRead: 7,
+      cacheWrite: 8,
+      totalTokens: 1_305,
+      totalTokensFresh: true,
+    };
+    const sessionStore: Record<string, SessionEntry> = { [sessionKey]: sessionEntry };
+    FOLLOWUP_TEST_SESSION_STORES.set(storePath, sessionStore);
+    const persistSpy = vi.spyOn(sessionRunAccounting, "persistRunSessionUsage");
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "internal announce complete" }],
+      meta: {
+        agentMeta: {
+          usage: { input: 39_908, output: 122 },
+          lastCallUsage: { input: 39_908, output: 122 },
+          model: "gemini-2.5-flash",
+          provider: "google",
+        },
+      },
+    });
+
+    const runner = createFollowupRunner({
+      opts: { onBlockReply: createAsyncReplySpy() },
+      typing: createMockTypingController(),
+      typingMode: "instant",
+      defaultModel: "openai-codex/gpt-5.5",
+      sessionEntry,
+      sessionStore,
+      sessionKey,
+      storePath,
+    });
+
+    await expect(
+      runner(
+        createQueuedRun({
+          run: {
+            inputProvenance: {
+              kind: "inter_session",
+              sourceSessionKey: "agent:codex:subagent:c34fca91",
+              sourceChannel: "__internal__",
+              sourceTool: "subagent_announce",
+            },
+          },
+        }),
+      ),
+    ).resolves.toBeUndefined();
+
+    const persistCall = requireMockCallArg(persistSpy, 0);
+    expect(persistCall.preserveUserFacingSessionModelState).toBe(true);
+    expect(sessionStore[sessionKey]?.modelProvider).toBe("openai-codex");
+    expect(sessionStore[sessionKey]?.model).toBe("gpt-5.5");
+    expect(sessionStore[sessionKey]?.contextTokens).toBe(200_000);
+    expect(sessionStore[sessionKey]?.inputTokens).toBe(1_234);
+    expect(sessionStore[sessionKey]?.outputTokens).toBe(56);
+    expect(sessionStore[sessionKey]?.cacheRead).toBe(7);
+    expect(sessionStore[sessionKey]?.cacheWrite).toBe(8);
+    expect(sessionStore[sessionKey]?.totalTokens).toBe(1_305);
+    expect(sessionStore[sessionKey]?.totalTokensFresh).toBe(true);
     persistSpy.mockRestore();
   });
 

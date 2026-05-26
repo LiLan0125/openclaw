@@ -63,6 +63,7 @@ vi.mock("./subagent-announce.runtime.js", () => ({
   isEmbeddedPiRunActive: (sessionId: string) => isEmbeddedPiRunActiveMock(sessionId),
   getRuntimeConfig: () => mockConfig,
   getSessionEntry: (params: { agentId: string; sessionKey: string }) => getSessionEntryMock(params),
+  readSessionMessagesAsync: vi.fn(async () => []),
   resolveAgentIdFromSessionKey: (sessionKey: string) =>
     resolveAgentIdFromSessionKeyMock(sessionKey),
   resolveMainSessionKey: (cfg: unknown) => resolveMainSessionKeyMock(cfg),

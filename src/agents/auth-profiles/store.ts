@@ -490,8 +490,19 @@ export function loadAuthProfileStoreForRuntime(
   });
 }
 
-export function loadAuthProfileStoreForSecretsRuntime(agentDir?: string): AuthProfileStore {
-  return loadAuthProfileStoreForRuntime(agentDir, { readOnly: true, allowKeychainPrompt: false });
+export function loadAuthProfileStoreForSecretsRuntime(
+  agentDir?: string,
+  options?: Pick<
+    LoadAuthProfileStoreOptions,
+    "config" | "externalCli" | "externalCliProviderIds" | "externalCliProfileIds"
+  >,
+): AuthProfileStore {
+  return loadAuthProfileStoreForRuntime(agentDir, {
+    ...options,
+    readOnly: true,
+    allowKeychainPrompt: false,
+    resolveLegacyOAuthSidecars: true,
+  });
 }
 
 export function loadAuthProfileStoreWithoutExternalProfiles(

@@ -1,8 +1,8 @@
 import type { ModelDefinitionConfig, ModelProviderConfig } from "../../config/types.js";
 import { normalizeGoogleApiBaseUrl } from "../../infra/google-api-base-url.js";
 import { normalizeOptionalLowercaseString } from "../../shared/string-coerce.js";
-import type { Api } from "../pi-ai-contract.js";
 import { isSecretRefHeaderValueMarker } from "../model-auth-markers.js";
+import type { Api } from "../pi-ai-contract.js";
 import { attachModelProviderLocalService } from "../provider-local-service.js";
 import {
   attachModelProviderRequestTransport,
@@ -40,6 +40,7 @@ export function normalizeResolvedTransportApi(
     case "bedrock-converse-stream":
     case "github-copilot":
     case "google-generative-ai":
+    case "google-vertex":
     case "ollama":
     case "openai-codex-responses":
     case "openai-completions":

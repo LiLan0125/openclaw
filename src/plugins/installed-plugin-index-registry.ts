@@ -1,11 +1,17 @@
 import { normalizePluginsConfig } from "./config-state.js";
-import { discoverOpenClawPlugins, type PluginCandidate } from "./discovery.js";
+import {
+  discoverOpenClawPlugins,
+  type PluginCandidate,
+  type PluginDiscoveryResult,
+} from "./discovery.js";
+import { loadInstalledPluginIndexInstallRecordsSync } from "./installed-plugin-index-record-reader.js";
 import type { LoadInstalledPluginIndexParams } from "./installed-plugin-index-types.js";
 import { loadPluginManifestRegistry, type PluginManifestRegistry } from "./manifest-registry.js";
 
 export function resolveInstalledPluginIndexRegistry(params: LoadInstalledPluginIndexParams): {
   registry: PluginManifestRegistry;
   candidates: readonly PluginCandidate[];
+  discovery?: PluginDiscoveryResult;
 } {
   if (params.candidates) {
     return {
@@ -22,15 +28,23 @@ export function resolveInstalledPluginIndexRegistry(params: LoadInstalledPluginI
   }
 
   const normalized = normalizePluginsConfig(params.config?.plugins);
-  const installRecords = params.installRecords ?? {};
-  const discovery = discoverOpenClawPlugins({
-    workspaceDir: params.workspaceDir,
-    extraPaths: normalized.loadPaths,
-    env: params.env,
-    installRecords,
-  });
+  const installRecords =
+    params.installRecords ??
+    loadInstalledPluginIndexInstallRecordsSync({
+      env: params.env,
+      ...(params.stateDir ? { stateDir: params.stateDir } : {}),
+    });
+  const discovery =
+    params.discovery ??
+    discoverOpenClawPlugins({
+      workspaceDir: params.workspaceDir,
+      extraPaths: normalized.loadPaths,
+      env: params.env,
+      installRecords,
+    });
   return {
     candidates: discovery.candidates,
+    discovery,
     registry: loadPluginManifestRegistry({
       config: params.config,
       workspaceDir: params.workspaceDir,

@@ -21,6 +21,10 @@ import {
 
 let tempRoots: string[] = [];
 
+const mockedChannelMigrationPlans = vi.hoisted(() => ({
+  plans: [] as Array<Record<string, unknown>>,
+}));
+
 vi.mock("../../channels/plugins/bundled.js", async () => {
   const actual = await vi.importActual<typeof import("../../channels/plugins/bundled.js")>(
     "../../channels/plugins/bundled.js",
@@ -70,6 +74,7 @@ vi.mock("../../channels/plugins/bundled.js", async () => {
     ]),
     listBundledChannelDoctorLegacyStateDetectors: vi.fn(() => [
       ({ oauthDir }: { oauthDir: string }) => detectWhatsAppLegacyStateMigrations({ oauthDir }),
+      () => mockedChannelMigrationPlans.plans,
     ]),
     listBundledChannelSetupPluginsByFeature: vi.fn((feature: string) => {
       if (feature === "doctorSessionMigrationSurface") {
@@ -145,6 +150,7 @@ afterEach(async () => {
   closeOpenClawAgentDatabasesForTest();
   closeOpenClawStateDatabaseForTest();
   resetAutoMigrateLegacyStateDirForTest();
+  mockedChannelMigrationPlans.plans = [];
   await Promise.all(
     tempRoots.map((root) => fs.promises.rm(root, { recursive: true, force: true })),
   );
@@ -180,6 +186,20 @@ async function detectAndRunMigrations(params: {
     env: { OPENCLAW_STATE_DIR: params.root } as NodeJS.ProcessEnv,
   });
   await runLegacyStateMigrations({ detected, now: params.now });
+}
+
+async function withStateDir<T>(root: string, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = root;
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.OPENCLAW_STATE_DIR;
+    } else {
+      process.env.OPENCLAW_STATE_DIR = previous;
+    }
+  }
 }
 
 function readSessionsStore(params: { root: string; targetDir: string }) {
@@ -745,6 +765,101 @@ describe("doctor legacy state migrations", () => {
     });
     const result = await runLegacyStateMigrations({ detected });
     expect(result.changes).toStrictEqual([]);
+  });
+
+  it("imports plugin-state legacy plans through doctor", async () => {
+    const root = await makeTempRoot();
+    const sourcePath = path.join(root, "legacy-cache.json");
+    const globalSourcePath = path.join(root, "legacy-global-cache.json");
+    fs.writeFileSync(sourcePath, "legacy", "utf-8");
+    fs.writeFileSync(globalSourcePath, "global", "utf-8");
+    mockedChannelMigrationPlans.plans = [
+      {
+        kind: "plugin-state-import",
+        label: "Test prompt-context cache",
+        sourcePath,
+        targetPath: "plugin state:test.prompt-cache",
+        pluginId: "telegram",
+        namespace: "test.prompt-cache",
+        maxEntries: 4,
+        scopeKey: "scope",
+        cleanupSource: "rename",
+        readEntries: () => [
+          { key: "old", value: { body: "old" } },
+          { key: "existing", value: { body: "stale" } },
+          { key: "overflow", value: { body: "overflow" } },
+        ],
+      },
+      {
+        kind: "plugin-state-import",
+        label: "Test global cache",
+        sourcePath: globalSourcePath,
+        targetPath: "plugin state:test.global-cache",
+        pluginId: "telegram",
+        namespace: "test.global-cache",
+        maxEntries: 4,
+        scopeKey: "",
+        cleanupSource: "rename",
+        readEntries: () => [{ key: "default", value: { body: "global" } }],
+      },
+    ];
+
+    await withStateDir(root, async () => {
+      const store = createPluginStateKeyedStore<{ body: string }>("telegram", {
+        namespace: "test.prompt-cache",
+        maxEntries: 4,
+      });
+      await store.register("scope:existing", { body: "fresh" });
+      await store.register("other:keep", { body: "other" });
+    });
+    resetPluginStateStoreForTests();
+
+    const detected = await detectLegacyStateMigrations({
+      cfg: {},
+      env: { OPENCLAW_STATE_DIR: root } as NodeJS.ProcessEnv,
+    });
+    const result = await runLegacyStateMigrations({ detected });
+
+    expect(result.warnings).toStrictEqual([]);
+    expect(result.changes).toContain("Migrated 2 Test prompt-context cache entries → plugin state");
+    expect(result.changes).toContain("Migrated 1 Test global cache entry → plugin state");
+    expect(result.changes).toContain(
+      `Archived Test prompt-context cache legacy source → ${sourcePath}.migrated`,
+    );
+    expect(result.changes).toContain(
+      `Archived Test global cache legacy source → ${globalSourcePath}.migrated`,
+    );
+    expect(fs.existsSync(sourcePath)).toBe(false);
+    expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(true);
+    expect(fs.existsSync(globalSourcePath)).toBe(false);
+    expect(fs.existsSync(`${globalSourcePath}.migrated`)).toBe(true);
+
+    await withStateDir(root, async () => {
+      const store = createPluginStateKeyedStore<{ body: string }>("telegram", {
+        namespace: "test.prompt-cache",
+        maxEntries: 4,
+      });
+      const valuesByKey = new Map(
+        (await store.entries()).map(({ key, value }) => [key, value.body]),
+      );
+      expect(Object.fromEntries(valuesByKey)).toEqual({
+        "other:keep": "other",
+        "scope:existing": "fresh",
+        "scope:old": "old",
+        "scope:overflow": "overflow",
+      });
+
+      const globalStore = createPluginStateKeyedStore<{ body: string }>("telegram", {
+        namespace: "test.global-cache",
+        maxEntries: 4,
+      });
+      const globalValuesByKey = new Map(
+        (await globalStore.entries()).map(({ key, value }) => [key, value.body]),
+      );
+      expect(Object.fromEntries(globalValuesByKey)).toEqual({
+        default: "global",
+      });
+    });
   });
 
   it("routes legacy state to the default agent entry", async () => {

@@ -13,8 +13,8 @@ let modelSupportsInput: typeof import("./model-catalog.js").modelSupportsInput;
 let resetModelCatalogCacheForTest: typeof import("./model-catalog.js").resetModelCatalogCacheForTest;
 let augmentCatalogMock: ReturnType<typeof vi.fn>;
 let ensureOpenClawModelCatalogMock: ReturnType<typeof vi.fn>;
-let currentPluginMetadataSnapshotMock: ReturnType<typeof vi.fn>;
-let loadPluginMetadataSnapshotMock: ReturnType<typeof vi.fn>;
+let currentPluginMetadataSnapshotMock: ReturnType<typeof vi.fn<(...args: unknown[]) => unknown>>;
+let loadPluginMetadataSnapshotMock: ReturnType<typeof vi.fn<(...args: unknown[]) => unknown>>;
 let readFileMock: ReturnType<typeof vi.fn>;
 let storedModelsConfigRaw: string | undefined;
 
@@ -189,13 +189,15 @@ describe("loadModelCatalog", () => {
     vi.doMock("../plugins/provider-runtime.runtime.js", () => ({
       augmentModelCatalogWithProviderPlugins: vi.fn().mockResolvedValue([]),
     }));
-    currentPluginMetadataSnapshotMock = vi.fn();
-    loadPluginMetadataSnapshotMock = vi.fn();
+    currentPluginMetadataSnapshotMock = vi.fn<(...args: unknown[]) => unknown>();
+    loadPluginMetadataSnapshotMock = vi.fn<(...args: unknown[]) => unknown>();
     vi.doMock("../plugins/current-plugin-metadata-snapshot.js", () => ({
       getCurrentPluginMetadataSnapshot: currentPluginMetadataSnapshotMock,
     }));
     vi.doMock("../plugins/plugin-metadata-snapshot.js", () => ({
       loadPluginMetadataSnapshot: loadPluginMetadataSnapshotMock,
+      resolvePluginMetadataSnapshot: (...args: unknown[]) =>
+        currentPluginMetadataSnapshotMock(...args) ?? loadPluginMetadataSnapshotMock(...args),
     }));
 
     ({
@@ -221,7 +223,7 @@ describe("loadModelCatalog", () => {
     ensureOpenClawModelCatalogMock.mockClear();
     augmentCatalogMock.mockClear();
     currentPluginMetadataSnapshotMock.mockReset();
-    currentPluginMetadataSnapshotMock.mockReturnValue(emptyPluginMetadataSnapshot());
+    currentPluginMetadataSnapshotMock.mockReturnValue(undefined);
     loadPluginMetadataSnapshotMock.mockReset();
     loadPluginMetadataSnapshotMock.mockReturnValue(emptyPluginMetadataSnapshot());
   });
@@ -512,7 +514,7 @@ describe("loadModelCatalog", () => {
   });
 
   it("normalizes persisted read-only catalog rows with manifest model id policies", async () => {
-    currentPluginMetadataSnapshotMock.mockReturnValueOnce(modelIdNormalizationSnapshot());
+    currentPluginMetadataSnapshotMock.mockReturnValue(modelIdNormalizationSnapshot());
     readFileMock.mockResolvedValueOnce(
       JSON.stringify({
         providers: {

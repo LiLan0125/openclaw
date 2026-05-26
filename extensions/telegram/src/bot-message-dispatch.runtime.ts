@@ -1,7 +1,10 @@
 export {
+  loadSessionStore,
   readLatestAssistantTextFromSessionTranscript,
   getSessionEntry,
   listSessionEntries,
+  resolveAndPersistSessionFile,
+  resolveSessionStoreEntry,
   resolveSessionRowEntry,
 } from "openclaw/plugin-sdk/session-store-runtime";
 export { resolveMarkdownTableMode } from "openclaw/plugin-sdk/markdown-table-runtime";

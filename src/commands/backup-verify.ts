@@ -66,6 +66,12 @@ export type VerifiedBackupArchive = {
   manifest: BackupManifest;
 };
 
+type ArchiveEntry = {
+  path: string;
+  linkpath?: string;
+  type?: string;
+};
+
 function stripTrailingSlashes(value: string): string {
   return value.replace(/\/+$/u, "");
 }
@@ -199,27 +205,18 @@ function parseManifest(raw: string): BackupManifest {
   };
 }
 
-type BackupArchiveEntry = {
-  path: string;
-  type: string;
-};
-
-function archiveEntryType(entry: unknown): string {
-  const type = (entry as { type?: unknown }).type;
-  return typeof type === "string" ? type : "";
-}
-
-function isUnsafeBackupArchiveEntryType(type: string): boolean {
-  return type === "SymbolicLink" || type === "Link";
-}
-
-async function listArchiveEntries(archivePath: string): Promise<BackupArchiveEntry[]> {
-  const entries: BackupArchiveEntry[] = [];
+async function listArchiveEntries(archivePath: string): Promise<ArchiveEntry[]> {
+  const entries: ArchiveEntry[] = [];
   await tar.t({
     file: archivePath,
     gzip: true,
     onentry: (entry) => {
-      entries.push({ path: entry.path, type: archiveEntryType(entry) });
+      entries.push({
+        path: entry.path,
+        ...(entry.linkpath ? { linkpath: entry.linkpath } : {}),
+        ...(entry.type ? { type: entry.type } : {}),
+      });
+      entry.resume();
     },
   });
   return entries;
@@ -364,6 +361,26 @@ async function verifyDatabaseSnapshots(params: {
   }
 }
 
+function verifyHardlinkTargetsAgainstArchiveRoot(
+  hardlinkTargets: Array<{ entryPath: string; normalized: string }>,
+  archiveRoot: string,
+  entries: Set<string>,
+): void {
+  const normalizedRoot = normalizeArchiveRoot(archiveRoot);
+  for (const target of hardlinkTargets) {
+    if (!isArchivePathWithin(target.normalized, normalizedRoot)) {
+      throw new Error(
+        `Archive hardlink target is outside the declared archive root: ${target.entryPath} -> ${target.normalized}`,
+      );
+    }
+    if (!entries.has(target.normalized)) {
+      throw new Error(
+        `Archive hardlink target is missing from archive entries: ${target.entryPath} -> ${target.normalized}`,
+      );
+    }
+  }
+}
+
 function formatResult(result: BackupVerifyResult): string {
   return [
     `Backup archive OK: ${result.archivePath}`,
@@ -400,14 +417,25 @@ export async function verifyBackupArchive(opts: {
   const entries = rawEntries.map((entry) => ({
     raw: entry.path,
     normalized: normalizeArchivePath(entry.path, "Archive entry"),
-    type: entry.type,
   }));
-  const unsafeEntry = entries.find((entry) => isUnsafeBackupArchiveEntryType(entry.type));
-  if (unsafeEntry) {
+  const symlinkEntry = rawEntries.find((entry) => entry.type === "SymbolicLink");
+  if (symlinkEntry) {
     throw new Error(
-      `Archive entry uses unsupported link type ${unsafeEntry.type}: ${unsafeEntry.normalized}`,
+      `Archive entry uses unsupported link type SymbolicLink: ${normalizeArchivePath(
+        symlinkEntry.path,
+        "Archive entry",
+      )}`,
     );
   }
+  const hardlinkTargets = rawEntries
+    .filter((entry) => entry.type === "Link" && entry.linkpath)
+    .map((entry) => ({
+      entryPath: entry.path,
+      normalized: normalizeArchivePath(
+        entry.linkpath ?? "",
+        `Archive hardlink target for ${entry.path}`,
+      ),
+    }));
   const normalizedEntrySet = new Set(entries.map((entry) => entry.normalized));
 
   const manifestMatches = entries.filter((entry) => isRootManifestEntry(entry.normalized));
@@ -426,6 +454,11 @@ export async function verifyBackupArchive(opts: {
   const manifestRaw = await extractManifest({ archivePath, manifestEntryPath });
   const manifest = verifyManifestAgainstEntries(parseManifest(manifestRaw), normalizedEntrySet);
   await verifyDatabaseSnapshots({ archivePath, manifest });
+  verifyHardlinkTargetsAgainstArchiveRoot(
+    hardlinkTargets,
+    manifest.archiveRoot,
+    normalizedEntrySet,
+  );
 
   const result: BackupVerifyResult = {
     ok: true,

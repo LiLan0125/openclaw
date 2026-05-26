@@ -5,6 +5,7 @@ import {
 } from "../../../auto-reply/tokens.js";
 import type { EmbeddedPiExecutionContract } from "../../../config/types.agent-defaults.js";
 import { normalizeLowercaseStringOrEmpty } from "../../../shared/string-coerce.js";
+import { hasAcceptedSessionSpawn } from "../../accepted-session-spawn.js";
 import type { AgentMessage } from "../../agent-core-contract.js";
 import { collectTextContentBlocks } from "../../content-blocks.js";
 import {
@@ -27,10 +28,9 @@ type ReplayMetadataAttempt = Pick<
   | "didSendViaMessagingTool"
   | "messagingToolSentTexts"
   | "messagingToolSentMediaUrls"
-  | "acceptedSessionSpawns"
   | "successfulCronAdds"
 > &
-  Partial<Pick<EmbeddedRunAttemptResult, "messagingToolSentTargets">>;
+  Partial<Pick<EmbeddedRunAttemptResult, "messagingToolSentTargets" | "acceptedSessionSpawns">>;
 
 type IncompleteTurnAttempt = Pick<
   EmbeddedRunAttemptResult,
@@ -49,7 +49,9 @@ type IncompleteTurnAttempt = Pick<
   | "replayMetadata"
   | "promptErrorSource"
   | "timedOutDuringCompaction"
->;
+  | "toolMetas"
+> &
+  Partial<Pick<EmbeddedRunAttemptResult, "acceptedSessionSpawns">>;
 
 type PlanningOnlyAttempt = Pick<
   EmbeddedRunAttemptResult,
@@ -218,9 +220,12 @@ export function buildAttemptReplayMetadata(
   params: ReplayMetadataAttempt,
 ): EmbeddedRunAttemptResult["replayMetadata"] {
   const hadMutatingTools = params.toolMetas.some((t) => isLikelyMutatingToolName(t.toolName));
+  const hadAsyncStartedTool = params.toolMetas.some((t) => t.asyncStarted === true);
   const hadPotentialSideEffects =
     hadMutatingTools ||
+    hadAsyncStartedTool ||
     hasMessagingToolDeliveryEvidence(params) ||
+    hasAcceptedSessionSpawn(params.acceptedSessionSpawns) ||
     (params.successfulCronAdds ?? 0) > 0;
   return {
     hadPotentialSideEffects,
@@ -267,6 +272,14 @@ export function resolveIncompleteTurnPayloadText(params: {
     return null;
   }
 
+  if (hasAcceptedSessionSpawn(params.attempt.acceptedSessionSpawns)) {
+    return null;
+  }
+
+  if (hasAsyncStartedToolActivity(params.attempt.toolMetas)) {
+    return null;
+  }
+
   const stopReason = params.attempt.lastAssistant?.stopReason;
   const incompleteTerminalAssistant = isIncompleteTerminalAssistantTurn({
     hasAssistantVisibleText: params.payloadCount > 0,
@@ -303,6 +316,10 @@ function hasOnlySilentAssistantReply(assistantTexts?: readonly string[]): boolea
     nonEmptyTexts.length > 0 &&
     nonEmptyTexts.every((text) => isSilentReplyPayloadText(text, SILENT_REPLY_TOKEN))
   );
+}
+
+function hasAsyncStartedToolActivity(toolMetas?: readonly { asyncStarted?: boolean }[]): boolean {
+  return (toolMetas ?? []).some((entry) => entry.asyncStarted === true);
 }
 
 function isToolResultRole(role: string): boolean {

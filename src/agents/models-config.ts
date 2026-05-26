@@ -6,10 +6,9 @@ import {
   type OpenClawConfig,
 } from "../config/config.js";
 import { createConfigRuntimeEnv } from "../config/env-vars.js";
-import { getCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-snapshot.js";
 import { resolveInstalledManifestRegistryIndexFingerprint } from "../plugins/manifest-registry-installed.js";
 import {
-  loadPluginMetadataSnapshot,
+  resolvePluginMetadataSnapshot,
   type PluginMetadataSnapshot,
 } from "../plugins/plugin-metadata-snapshot.js";
 import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db.js";
@@ -187,11 +186,7 @@ export async function ensureOpenClawModelCatalog(
       : resolveAgentWorkspaceDir(cfg, resolveDefaultAgentId(cfg)));
   const pluginMetadataSnapshot =
     options.pluginMetadataSnapshot ??
-    getCurrentPluginMetadataSnapshot({
-      config: cfg,
-      ...(workspaceDir ? { workspaceDir } : {}),
-    }) ??
-    loadPluginMetadataSnapshot({
+    resolvePluginMetadataSnapshot({
       config: cfg,
       env: createConfigRuntimeEnv(cfg),
       ...(workspaceDir ? { workspaceDir } : {}),
