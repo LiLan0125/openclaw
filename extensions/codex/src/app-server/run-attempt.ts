@@ -3066,8 +3066,11 @@ export async function runCodexAppServerAttempt(
     if (activeContextEngine) {
       const activeContextEnginePluginId = resolveContextEngineOwnerPluginId(activeContextEngine);
       const finalMessages =
-        (await readMirroredSessionHistoryMessages(activeSessionFile)) ??
-        historyMessages.concat(result.messagesSnapshot);
+        (await readMirroredSessionHistoryMessages({
+          agentId: sessionAgentId,
+          sessionId: activeSessionId,
+          path: params.path,
+        })) ?? historyMessages.concat(result.messagesSnapshot);
       await finalizeHarnessContextEngineTurn({
         contextEngine: activeContextEngine,
         promptError: Boolean(finalPromptError),
@@ -4994,13 +4997,16 @@ function readBoolean(record: JsonObject, key: string): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-async function readMirroredSessionHistoryMessages(
-  sessionFile: string,
-): Promise<AgentMessage[] | undefined> {
-  const messages = await readCodexMirroredSessionHistoryMessages(sessionFile);
+async function readMirroredSessionHistoryMessages(scope: {
+  agentId: string;
+  path?: string;
+  sessionId: string;
+}): Promise<AgentMessage[] | undefined> {
+  const messages = await readCodexMirroredSessionHistoryMessages(scope);
   if (!messages) {
     embeddedAgentLog.warn("failed to read mirrored session history for codex harness hooks", {
-      sessionFile,
+      agentId: scope.agentId,
+      sessionId: scope.sessionId,
     });
   }
   return messages;
@@ -5507,8 +5513,9 @@ async function mirrorTranscriptBestEffort(params: {
 }): Promise<void> {
   try {
     await mirrorCodexAppServerTranscript({
-      sessionFile: params.params.sessionFile,
       agentId: params.agentId,
+      path: params.params.path,
+      sessionId: params.params.sessionId,
       sessionKey: params.sessionKey,
       messages: params.result.messagesSnapshot,
       // Scope is thread-stable. Each entry in `messagesSnapshot` is tagged
@@ -5538,8 +5545,9 @@ async function mirrorPromptAtTurnStartBestEffort(params: {
   }
   try {
     await mirrorCodexAppServerTranscript({
-      sessionFile: params.params.sessionFile,
       agentId: params.agentId,
+      path: params.params.path,
+      sessionId: params.params.sessionId,
       sessionKey: params.sessionKey,
       messages: [
         attachCodexMirrorIdentity(
