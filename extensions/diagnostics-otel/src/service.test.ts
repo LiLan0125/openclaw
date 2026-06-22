@@ -1714,6 +1714,18 @@ describe("diagnostics-otel service", () => {
     expect(emitCall?.body).toBe("log");
   });
 
+  test("allows opt-in log body capture via object-form captureContent.logBodies", async () => {
+    const emitCall = await emitAndCaptureLog(
+      {
+        level: "INFO",
+        message: "model replied OTEL-QA-OK",
+      },
+      { captureContent: { enabled: true, logBodies: true } },
+    );
+
+    expect(emitCall?.body).toBe("model replied OTEL-QA-OK");
+  });
+
   test("redacts sensitive data from log messages before export when broad content capture is enabled", async () => {
     const emitCall = await emitAndCaptureLog(
       {

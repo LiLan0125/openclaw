@@ -324,6 +324,7 @@ export type DiagnosticsOtelConfig = {
         toolOutputs?: boolean;
         systemPrompt?: boolean;
         toolDefinitions?: boolean;
+        logBodies?: boolean;
       };
 };
 
