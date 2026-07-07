@@ -1259,6 +1259,49 @@ describe("initSessionState RawBody", () => {
     expect(store[sessionKey]?.pinnedAt).toBe(123);
   });
 
+  it("preserves dashboard label metadata across an implicit daily stale rollover (#101451)", async () => {
+    const root = await makeCaseDir("openclaw-daily-rollover-label-");
+    const storePath = path.join(root, "sessions.json");
+    const sessionKey = "agent:main:dashboard:018f52f9-6b44-7c00-bb31-4a9e2ef10145";
+    const existingSessionId = "session-before-daily-reset-label";
+    const staleStartedAt = Date.now() - 48 * 60 * 60 * 1000;
+
+    await writeSessionStoreFast(storePath, {
+      [sessionKey]: {
+        sessionId: existingSessionId,
+        updatedAt: staleStartedAt,
+        sessionStartedAt: staleStartedAt,
+        lastInteractionAt: staleStartedAt,
+        systemSent: true,
+        label: "Other",
+        displayName: "Dashboard Other",
+      },
+    });
+
+    const result = await initSessionState({
+      ctx: {
+        RawBody: "continue dashboard session",
+        ChatType: "direct",
+        SessionKey: sessionKey,
+      },
+      cfg: { session: { store: storePath } } as OpenClawConfig,
+      commandAuthorized: true,
+    });
+
+    expect(result.isNewSession).toBe(true);
+    expect(result.resetTriggered).toBe(false);
+    expect(result.sessionId).not.toBe(existingSessionId);
+    expect(result.sessionEntry.label).toBe("Other");
+    expect(result.sessionEntry.displayName).toBe("Dashboard Other");
+
+    const store = JSON.parse(await fs.readFile(storePath, "utf-8")) as Record<
+      string,
+      { label?: string; displayName?: string }
+    >;
+    expect(store[sessionKey]?.label).toBe("Other");
+    expect(store[sessionKey]?.displayName).toBe("Dashboard Other");
+  });
+
   it("preserves usage footer mode across daily rollover", async () => {
     const root = await makeCaseDir("openclaw-daily-rollover-usage-");
     const storePath = path.join(root, "sessions.json");
